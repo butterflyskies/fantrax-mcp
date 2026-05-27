@@ -11,8 +11,13 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    analysis, briefing, config::Config, db::Database, fantrax::FantraxClient, mlb::MlbClient,
+    analysis, briefing,
+    config::Config,
+    db::Database,
+    fantrax::FantraxClient,
+    mlb::MlbClient,
     projections::ProjectionClient,
+    types::{LeagueId, TeamId},
 };
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -32,13 +37,13 @@ fn parse_date_or_today(date: Option<&str>) -> Result<NaiveDate, ErrorData> {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LeagueIdArgs {
     /// The Fantrax league ID.
-    pub league_id: String,
+    pub league_id: LeagueId,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RosterArgs {
     /// The Fantrax league ID.
-    pub league_id: String,
+    pub league_id: LeagueId,
     /// The scoring period (e.g. "1", "2", or "current").
     pub period: String,
 }
@@ -101,7 +106,7 @@ pub struct LogRecommendationArgs {
     /// The agent making the recommendation (e.g. "ariadne", "vesper").
     pub agent_id: String,
     /// The Fantrax league ID.
-    pub league_id: String,
+    pub league_id: LeagueId,
     /// Type of recommendation: pickup, drop, start, sit, waiver.
     pub recommendation_type: RecommendationType,
     /// JSON array of player IDs involved.
@@ -113,7 +118,7 @@ pub struct LogRecommendationArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct QueryLedgerArgs {
     /// The Fantrax league ID.
-    pub league_id: String,
+    pub league_id: LeagueId,
     /// Optional: filter by agent ID.
     pub agent_id: Option<String>,
 }
@@ -143,11 +148,11 @@ pub struct PlayerSnippetArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OptimizeLineupArgs {
     /// The Fantrax league ID.
-    pub league_id: String,
+    pub league_id: LeagueId,
     /// The scoring period (e.g. "1", "2", or "current").
     pub period: String,
     /// Your team ID within the league.
-    pub team_id: String,
+    pub team_id: TeamId,
     /// Date for the schedule (YYYY-MM-DD). Defaults to today.
     pub date: Option<String>,
     /// Number of lineup slots to fill. If omitted, returns all recommendations.
@@ -157,10 +162,10 @@ pub struct OptimizeLineupArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct BriefingArgs {
     /// The Fantrax league ID. If omitted, generates briefings for all configured leagues.
-    pub league_id: Option<String>,
+    pub league_id: Option<LeagueId>,
     /// Your team ID within the league. When omitted with multiple leagues, only
     /// league-level information is included (roster-specific layers are skipped).
-    pub team_id: Option<String>,
+    pub team_id: Option<TeamId>,
     /// The scoring period (e.g. "1", "2", or "current").
     #[serde(default = "default_period")]
     pub period: String,
@@ -753,7 +758,7 @@ impl FantraxServer {
             // For now, we look up each player from the MLB API by iterating
             // through games to find them, or we try the Fantrax player_id
             // as a potential MLB ID (numeric).
-            if let Ok(mlb_id) = rp.player_id.parse::<u64>() {
+            if let Ok(mlb_id) = rp.player_id.as_str().parse::<u64>() {
                 match self.state.mlb.get_player(mlb_id).await {
                     Ok(player) => {
                         player_pairs.push((rp.clone(), player));
@@ -761,7 +766,7 @@ impl FantraxServer {
                     Err(e) => {
                         lookup_failures.push(json!({
                             "player": rp.name,
-                            "player_id": rp.player_id,
+                            "player_id": rp.player_id.as_str(),
                             "error": format!("MLB lookup failed: {e}"),
                         }));
                     }
@@ -769,7 +774,7 @@ impl FantraxServer {
             } else {
                 lookup_failures.push(json!({
                     "player": rp.name,
-                    "player_id": rp.player_id,
+                    "player_id": rp.player_id.as_str(),
                     "error": "non-numeric player ID — cannot resolve via MLB API",
                 }));
             }
@@ -795,7 +800,7 @@ impl FantraxServer {
             "recommendations": final_recs.iter().map(|r| {
                 json!({
                     "player": r.player_name,
-                    "player_id": r.player_id,
+                    "player_id": r.player_id.as_str(),
                     "recommendation": r.verdict.to_string(),
                     "matchup_advantage": r.matchup_advantage.map(|a| a.to_string()),
                     "opposing_pitcher": r.opposing_pitcher,
@@ -844,7 +849,7 @@ impl FantraxServer {
                         .config
                         .leagues
                         .iter()
-                        .map(|l| l.id.as_str())
+                        .map(|l| l.id.to_string())
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),

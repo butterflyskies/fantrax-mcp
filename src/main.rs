@@ -15,12 +15,25 @@ use fantrax_mcp::server::{AppState, FantraxServer};
 #[derive(Parser, Debug)]
 #[command(
     name = "fantrax-mcp",
-    about = "Fantasy baseball MCP server for Fantrax"
+    about = "Fantasy baseball MCP server for Fantrax",
+    version
 )]
 struct Cli {
     /// Path to TOML config file
     #[arg(short, long, default_value = "config.toml")]
     config: std::path::PathBuf,
+
+    /// Override server port from config
+    #[arg(short, long)]
+    port: Option<u16>,
+
+    /// Override bind address from config (e.g. 0.0.0.0 for containers)
+    #[arg(long)]
+    bind_addr: Option<std::net::IpAddr>,
+
+    /// Override database path from config
+    #[arg(long)]
+    db_path: Option<String>,
 
     /// Maximum concurrent MCP sessions
     #[arg(long, default_value = "10")]
@@ -40,6 +53,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let mut config = Config::load(&cli.config)?;
+
+    if let Some(port) = cli.port {
+        config.server.port = port;
+    }
+    if let Some(addr) = cli.bind_addr {
+        config.server.bind_addr = addr;
+    }
+    if let Some(ref db_path) = cli.db_path {
+        config.server.db_path = db_path.clone();
+    }
+
     tracing::info!(
         port = config.server.port,
         leagues = config.leagues.len(),
@@ -47,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let port = config.server.port;
+    let bind_addr = config.server.bind_addr;
     let db_path = config.server.resolved_db_path();
     let db = Database::open(&db_path)
         .map_err(|e| format!("failed to open database at {}: {e}", db_path.display()))?;
@@ -90,11 +115,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         StreamableHttpServerConfig::default(),
     );
 
+    let readyz_db = Arc::clone(&state.db);
     let router = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/readyz",
+            axum::routing::get(move || {
+                let db = Arc::clone(&readyz_db);
+                async move {
+                    match db.health_check() {
+                        Ok(()) => (axum::http::StatusCode::OK, "ready"),
+                        Err(_) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready"),
+                    }
+                }
+            }),
+        )
         .nest_service("/mcp", service);
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = std::net::SocketAddr::from((bind_addr, port));
     tracing::info!(%addr, "fantrax-mcp server starting");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

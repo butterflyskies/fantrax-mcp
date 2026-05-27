@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::instrument;
 
+use crate::types::{LeagueId, PlayerId, TeamId};
 use crate::util::{json_f64, json_u32};
 
 /// Base URL for the Fantrax beta API.
@@ -48,7 +49,7 @@ impl From<reqwest::Error> for FantraxError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct League {
-    pub id: String,
+    pub id: LeagueId,
     pub name: String,
     /// Raw JSON from the API for fields we haven't strongly typed yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,7 +58,7 @@ pub struct League {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Roster {
-    pub league_id: String,
+    pub league_id: LeagueId,
     pub period: String,
     pub teams: Vec<TeamRoster>,
     /// Raw JSON from the API.
@@ -67,14 +68,14 @@ pub struct Roster {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamRoster {
-    pub team_id: String,
+    pub team_id: TeamId,
     pub team_name: String,
     pub players: Vec<RosterPlayer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RosterPlayer {
-    pub player_id: String,
+    pub player_id: PlayerId,
     pub name: String,
     pub position: String,
     pub roster_status: String,
@@ -82,7 +83,7 @@ pub struct RosterPlayer {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Standings {
-    pub league_id: String,
+    pub league_id: LeagueId,
     pub teams: Vec<TeamStanding>,
     /// Raw JSON from the API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,7 +92,7 @@ pub struct Standings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamStanding {
-    pub team_id: String,
+    pub team_id: TeamId,
     pub team_name: String,
     pub rank: u32,
     pub wins: u32,
@@ -102,7 +103,7 @@ pub struct TeamStanding {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeagueInfo {
-    pub id: String,
+    pub id: LeagueId,
     pub name: String,
     /// Raw JSON from the API — contains teams, matchup schedules, roster
     /// constraints, scoring config, player eligibility, etc.
@@ -112,15 +113,19 @@ pub struct LeagueInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerIds {
     pub sport: String,
-    pub players: Vec<PlayerId>,
+    pub players: Vec<PlayerIdEntry>,
     /// Raw JSON from the API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<Value>,
 }
 
+/// A player ID/name pair from the Fantrax `getPlayerIds` endpoint.
+///
+/// Not to be confused with `crate::types::PlayerId`, which is the newtype
+/// wrapper around a single player ID string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlayerId {
-    pub id: String,
+pub struct PlayerIdEntry {
+    pub id: PlayerId,
     pub name: String,
 }
 
@@ -180,11 +185,11 @@ impl FantraxClient {
         let leagues = leagues_array
             .iter()
             .filter_map(|entry| {
-                let id = entry
+                let id: LeagueId = entry
                     .get("leagueId")
                     .or_else(|| entry.get("league_id"))
                     .and_then(|v| v.as_str())
-                    .map(String::from)?;
+                    .map(LeagueId::new)?;
                 let name = entry
                     .get("leagueName")
                     .or_else(|| entry.get("league_name"))
@@ -207,19 +212,19 @@ impl FantraxClient {
     ///
     /// Calls `GET /getLeagueInfo?leagueId={id}`.
     #[instrument(skip(self), fields(endpoint = "getLeagueInfo"))]
-    pub async fn get_league_info(&self, league_id: &str) -> Result<LeagueInfo, FantraxError> {
+    pub async fn get_league_info(&self, league_id: &LeagueId) -> Result<LeagueInfo, FantraxError> {
         let url = format!("{BASE_URL}/getLeagueInfo");
         let resp: Value = self
             .http
             .get(&url)
-            .query(&[("leagueId", league_id)])
+            .query(&[("leagueId", league_id.as_str())])
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?;
 
-        tracing::debug!(league_id, response = %resp, "getLeagueInfo raw response");
+        tracing::debug!(league_id = %league_id, response = %resp, "getLeagueInfo raw response");
 
         // Extract league name from response if available.
         let name = resp
@@ -234,7 +239,7 @@ impl FantraxClient {
             .to_string();
 
         Ok(LeagueInfo {
-            id: league_id.to_string(),
+            id: league_id.clone(),
             name,
             raw: resp,
         })
@@ -246,21 +251,21 @@ impl FantraxClient {
     #[instrument(skip(self), fields(endpoint = "getTeamRosters"))]
     pub async fn get_team_rosters(
         &self,
-        league_id: &str,
+        league_id: &LeagueId,
         period: &str,
     ) -> Result<Roster, FantraxError> {
         let url = format!("{BASE_URL}/getTeamRosters");
         let resp: Value = self
             .http
             .get(&url)
-            .query(&[("leagueId", league_id), ("period", period)])
+            .query(&[("leagueId", league_id.as_str()), ("period", period)])
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?;
 
-        tracing::debug!(league_id, period, response = %resp, "getTeamRosters raw response");
+        tracing::debug!(league_id = %league_id, period, response = %resp, "getTeamRosters raw response");
 
         // Parse team rosters from the response. Expected shape varies, so we
         // try multiple paths.
@@ -273,11 +278,11 @@ impl FantraxClient {
             teams_arr
                 .iter()
                 .filter_map(|team| {
-                    let team_id = team
+                    let team_id: TeamId = team
                         .get("teamId")
                         .or_else(|| team.get("team_id"))
                         .and_then(|v| v.as_str())
-                        .map(String::from)?;
+                        .map(TeamId::new)?;
                     let team_name = team
                         .get("teamName")
                         .or_else(|| team.get("team_name"))
@@ -305,7 +310,7 @@ impl FantraxClient {
         };
 
         Ok(Roster {
-            league_id: league_id.to_string(),
+            league_id: league_id.clone(),
             period: period.to_string(),
             teams,
             raw: Some(resp),
@@ -316,19 +321,19 @@ impl FantraxClient {
     ///
     /// Calls `GET /getStandings?leagueId={id}`.
     #[instrument(skip(self), fields(endpoint = "getStandings"))]
-    pub async fn get_standings(&self, league_id: &str) -> Result<Standings, FantraxError> {
+    pub async fn get_standings(&self, league_id: &LeagueId) -> Result<Standings, FantraxError> {
         let url = format!("{BASE_URL}/getStandings");
         let resp: Value = self
             .http
             .get(&url)
-            .query(&[("leagueId", league_id)])
+            .query(&[("leagueId", league_id.as_str())])
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?;
 
-        tracing::debug!(league_id, response = %resp, "getStandings raw response");
+        tracing::debug!(league_id = %league_id, response = %resp, "getStandings raw response");
 
         // Parse standings from the response.
         let standings_value = resp
@@ -339,11 +344,11 @@ impl FantraxClient {
         let teams = if let Some(arr) = standings_value.and_then(|v| v.as_array()) {
             arr.iter()
                 .filter_map(|entry| {
-                    let team_id = entry
+                    let team_id: TeamId = entry
                         .get("teamId")
                         .or_else(|| entry.get("team_id"))
                         .and_then(|v| v.as_str())
-                        .map(String::from)?;
+                        .map(TeamId::new)?;
                     let team_name = entry
                         .get("teamName")
                         .or_else(|| entry.get("team_name"))
@@ -373,7 +378,7 @@ impl FantraxClient {
         };
 
         Ok(Standings {
-            league_id: league_id.to_string(),
+            league_id: league_id.clone(),
             teams,
             raw: Some(resp),
         })
@@ -406,25 +411,25 @@ impl FantraxClient {
         let players = if let Some(arr) = players_value.and_then(|v| v.as_array()) {
             arr.iter()
                 .filter_map(|entry| {
-                    let id = entry
+                    let id: PlayerId = entry
                         .get("playerId")
                         .or_else(|| entry.get("id"))
                         .and_then(|v| v.as_str())
-                        .map(String::from)?;
+                        .map(PlayerId::new)?;
                     let name = entry
                         .get("name")
                         .or_else(|| entry.get("playerName"))
                         .and_then(|v| v.as_str())
                         .map(String::from)
                         .unwrap_or_else(|| "Unknown".to_string());
-                    Some(PlayerId { id, name })
+                    Some(PlayerIdEntry { id, name })
                 })
                 .collect()
         } else if let Some(obj) = players_value.and_then(|v| v.as_object()) {
             // Sometimes the API returns {playerId: playerName, ...} as an object.
             obj.iter()
-                .map(|(id, name)| PlayerId {
-                    id: id.clone(),
+                .map(|(id, name)| PlayerIdEntry {
+                    id: PlayerId::new(id),
                     name: name.as_str().unwrap_or("Unknown").to_string(),
                 })
                 .collect()
@@ -443,12 +448,12 @@ impl FantraxClient {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn extract_roster_player(p: &Value) -> Option<RosterPlayer> {
-    let player_id = p
+    let player_id: PlayerId = p
         .get("playerId")
         .or_else(|| p.get("player_id"))
         .or_else(|| p.get("id"))
         .and_then(|v| v.as_str())
-        .map(String::from)?;
+        .map(PlayerId::new)?;
     let name = p
         .get("name")
         .or_else(|| p.get("playerName"))

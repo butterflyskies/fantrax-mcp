@@ -8,6 +8,7 @@ use crate::config::{LeagueConfig, LineupType};
 use crate::db::Database;
 use crate::fantrax::{FantraxClient, Roster};
 use crate::mlb::{BatterLine, Boxscore, MlbClient, PitcherLine};
+use crate::types::{LeagueId, TeamId};
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -16,7 +17,7 @@ use crate::mlb::{BatterLine, Boxscore, MlbClient, PitcherLine};
 #[serde(rename_all = "camelCase")]
 pub struct Briefing {
     pub league_name: String,
-    pub league_id: String,
+    pub league_id: LeagueId,
     pub league_type: String,
     pub date: NaiveDate,
     pub what_happened: Vec<PlayerSnippet>,
@@ -75,7 +76,7 @@ pub enum BriefingError {
 /// to assemble all three briefing layers.
 pub async fn generate_briefing(
     league: &LeagueConfig,
-    team_id: &str,
+    team_id: &TeamId,
     period: &str,
     date: NaiveDate,
     fantrax: &FantraxClient,
@@ -114,12 +115,12 @@ pub async fn generate_briefing(
 /// Pull yesterday's boxscores and find each roster player's stat line.
 async fn build_what_happened(
     league: &LeagueConfig,
-    team_id: &str,
+    team_id: &TeamId,
     yesterday: NaiveDate,
     mlb: &MlbClient,
     roster: &Roster,
 ) -> Result<Vec<PlayerSnippet>, BriefingError> {
-    let team = roster.teams.iter().find(|t| t.team_id == team_id);
+    let team = roster.teams.iter().find(|t| t.team_id == *team_id);
     let players = match team {
         Some(t) => &t.players,
         None => {
@@ -160,7 +161,7 @@ async fn build_what_happened(
         }
 
         // Try to parse player_id as MLB numeric ID.
-        let mlb_id: Option<u64> = rp.player_id.parse().ok();
+        let mlb_id: Option<u64> = rp.player_id.as_str().parse().ok();
 
         let mut found = false;
         if let Some(pid) = mlb_id {
@@ -349,14 +350,14 @@ fn format_injury_line(status: &str) -> String {
 /// Generate action items based on today's matchups and roster status.
 async fn build_what_to_do(
     league: &LeagueConfig,
-    team_id: &str,
+    team_id: &TeamId,
     today: NaiveDate,
     mlb: &MlbClient,
     roster: &Roster,
 ) -> Result<Vec<ActionItem>, BriefingError> {
     let mut items = Vec::new();
 
-    let team = roster.teams.iter().find(|t| t.team_id == team_id);
+    let team = roster.teams.iter().find(|t| t.team_id == *team_id);
     let players = match team {
         Some(t) => &t.players,
         None => return Ok(items),
@@ -387,7 +388,7 @@ async fn build_what_to_do(
                 if is_injured_status(&rp.roster_status) {
                     continue;
                 }
-                if let Ok(mlb_id) = rp.player_id.parse::<u64>()
+                if let Ok(mlb_id) = rp.player_id.as_str().parse::<u64>()
                     && let Ok(player) = mlb.get_player(mlb_id).await
                 {
                     player_pairs.push((rp.clone(), player));
@@ -457,7 +458,7 @@ fn is_bench_or_il_slot(position: &str) -> bool {
 ///
 /// This is a placeholder for editorial commentary that will be LLM-generated
 /// in a future iteration.
-fn build_hot_takes(league_id: &str, db: &Arc<Database>) -> Vec<String> {
+fn build_hot_takes(league_id: &LeagueId, db: &Arc<Database>) -> Vec<String> {
     let recs = db.get_recommendations(league_id, None);
 
     // Only look at the 10 most recent entries.

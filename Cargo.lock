@@ -385,6 +385,7 @@ dependencies = [
  "reqwest",
  "rmcp",
  "rusqlite",
+ "schemars",
  "secrecy",
  "serde",
  "serde_json",

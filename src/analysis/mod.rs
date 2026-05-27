@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fantrax::RosterPlayer;
 use crate::mlb::{Game, PitcherInfo, Player};
+use crate::types::PlayerId;
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -12,7 +13,7 @@ use crate::mlb::{Game, PitcherInfo, Player};
 #[serde(rename_all = "camelCase")]
 pub struct StartSitRecommendation {
     pub player_name: String,
-    pub player_id: String,
+    pub player_id: PlayerId,
     pub verdict: LineupVerdict,
     pub reason: String,
     pub opposing_pitcher: Option<String>,
@@ -311,7 +312,7 @@ mod tests {
         let recs = vec![
             StartSitRecommendation {
                 player_name: "A".into(),
-                player_id: "1".into(),
+                player_id: PlayerId::new("1"),
                 verdict: LineupVerdict::Sit,
                 reason: String::new(),
                 opposing_pitcher: None,
@@ -319,7 +320,7 @@ mod tests {
             },
             StartSitRecommendation {
                 player_name: "B".into(),
-                player_id: "2".into(),
+                player_id: PlayerId::new("2"),
                 verdict: LineupVerdict::Start,
                 reason: String::new(),
                 opposing_pitcher: None,
@@ -327,7 +328,7 @@ mod tests {
             },
             StartSitRecommendation {
                 player_name: "C".into(),
-                player_id: "3".into(),
+                player_id: PlayerId::new("3"),
                 verdict: LineupVerdict::Start,
                 reason: String::new(),
                 opposing_pitcher: None,

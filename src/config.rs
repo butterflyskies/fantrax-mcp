@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use secrecy::SecretString;
 use serde::Deserialize;
 
+use crate::types::LeagueId;
+
 // ─── Error type ────────────────────────────────────────────────────────────
 
 /// Errors that can occur when loading configuration.
@@ -65,7 +67,7 @@ struct RawFantraxConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LeagueConfig {
-    pub id: String,
+    pub id: LeagueId,
     pub name: String,
     pub league_type: LeagueType,
     pub lineup: LineupType,
@@ -123,8 +125,14 @@ pub struct ProjectionsConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default = "default_bind_addr")]
+    pub bind_addr: std::net::IpAddr,
     pub port: u16,
     pub db_path: String,
+}
+
+fn default_bind_addr() -> std::net::IpAddr {
+    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
 }
 
 impl ServerConfig {

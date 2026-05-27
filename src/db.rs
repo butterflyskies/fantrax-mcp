@@ -7,6 +7,8 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::types::LeagueId;
+
 /// Counter for probabilistic cache eviction (1 in 100 writes triggers cleanup).
 static SET_CACHED_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -17,7 +19,7 @@ static SET_CACHED_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct Recommendation {
     pub id: i64,
     pub agent_id: String,
-    pub league_id: String,
+    pub league_id: LeagueId,
     pub recommendation_type: String,
     pub players: String,
     pub reasoning: String,
@@ -82,6 +84,11 @@ impl Database {
 ",
         )?;
         Ok(())
+    }
+
+    pub fn health_check(&self) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row("SELECT 1", [], |_| Ok(()))
     }
 
     // ─── Cache layer ────────────────────────────────────────────────────────
@@ -177,7 +184,7 @@ impl Database {
     pub fn log_recommendation(
         &self,
         agent_id: &str,
-        league_id: &str,
+        league_id: &LeagueId,
         recommendation_type: &str,
         players: &str,
         reasoning: &str,
@@ -190,7 +197,7 @@ impl Database {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 agent_id,
-                league_id,
+                league_id.as_str(),
                 recommendation_type,
                 players,
                 reasoning,
@@ -203,7 +210,7 @@ impl Database {
     /// Query recommendations, optionally filtered by agent_id.
     pub fn get_recommendations(
         &self,
-        league_id: &str,
+        league_id: &LeagueId,
         agent_id: Option<&str>,
     ) -> Vec<Recommendation> {
         let conn = self.conn.lock().expect("db mutex poisoned");
@@ -215,7 +222,10 @@ impl Database {
                  FROM recommendation_ledger WHERE league_id = ?1 AND agent_id = ?2 \
                  ORDER BY created_at DESC"
                     .to_string(),
-                vec![Box::new(league_id.to_string()), Box::new(aid.to_string())],
+                vec![
+                    Box::new(league_id.as_str().to_owned()),
+                    Box::new(aid.to_string()),
+                ],
             ),
             None => (
                 "SELECT id, agent_id, league_id, recommendation_type, players, reasoning, \
@@ -223,14 +233,14 @@ impl Database {
                  FROM recommendation_ledger WHERE league_id = ?1 \
                  ORDER BY created_at DESC"
                     .to_string(),
-                vec![Box::new(league_id.to_string())],
+                vec![Box::new(league_id.as_str().to_owned())],
             ),
         };
 
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(league_id, error = %e, "failed to prepare recommendation query");
+                tracing::warn!(%league_id, error = %e, "failed to prepare recommendation query");
                 return vec![];
             }
         };
@@ -242,7 +252,7 @@ impl Database {
             Ok(Recommendation {
                 id: row.get(0)?,
                 agent_id: row.get(1)?,
-                league_id: row.get(2)?,
+                league_id: LeagueId::new(row.get::<_, String>(2)?),
                 recommendation_type: row.get(3)?,
                 players: row.get(4)?,
                 reasoning: row.get(5)?,
@@ -257,13 +267,13 @@ impl Database {
                 .filter_map(|r| match r {
                     Ok(rec) => Some(rec),
                     Err(e) => {
-                        tracing::warn!(league_id, error = %e, "failed to deserialize recommendation row");
+                        tracing::warn!(%league_id, error = %e, "failed to deserialize recommendation row");
                         None
                     }
                 })
                 .collect(),
             Err(e) => {
-                tracing::warn!(league_id, error = %e, "failed to query recommendations");
+                tracing::warn!(%league_id, error = %e, "failed to query recommendations");
                 vec![]
             }
         }
@@ -307,7 +317,7 @@ impl Database {
     pub async fn log_recommendation_async(
         self: &Arc<Self>,
         agent_id: String,
-        league_id: String,
+        league_id: LeagueId,
         recommendation_type: String,
         players: String,
         reasoning: String,
@@ -328,7 +338,7 @@ impl Database {
 
     pub async fn get_recommendations_async(
         self: &Arc<Self>,
-        league_id: String,
+        league_id: LeagueId,
         agent_id: Option<String>,
     ) -> Vec<Recommendation> {
         let db = Arc::clone(self);
