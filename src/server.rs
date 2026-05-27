@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chrono;
+use chrono::NaiveDate;
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -14,6 +14,18 @@ use crate::{
     analysis, briefing, config::Config, db::Database, fantrax::FantraxClient, mlb::MlbClient,
     projections::ProjectionClient,
 };
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+/// Parse a YYYY-MM-DD date string, or default to today (UTC).
+fn parse_date_or_today(date: Option<&str>) -> Result<NaiveDate, ErrorData> {
+    match date {
+        Some(d) => NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|e| {
+            ErrorData::invalid_params(format!("invalid date format (use YYYY-MM-DD): {e}"), None)
+        }),
+        None => Ok(chrono::Utc::now().date_naive()),
+    }
+}
 
 // ─── Tool argument structs ──────────────────────────────────────────────────
 
@@ -146,8 +158,9 @@ pub struct OptimizeLineupArgs {
 pub struct BriefingArgs {
     /// The Fantrax league ID. If omitted, generates briefings for all configured leagues.
     pub league_id: Option<String>,
-    /// Your team ID within the league. Required to identify your roster.
-    pub team_id: String,
+    /// Your team ID within the league. When omitted with multiple leagues, only
+    /// league-level information is included (roster-specific layers are skipped).
+    pub team_id: Option<String>,
     /// The scoring period (e.g. "1", "2", or "current").
     #[serde(default = "default_period")]
     pub period: String,
@@ -155,10 +168,41 @@ pub struct BriefingArgs {
     pub date: Option<String>,
 }
 
+/// Player type for projection queries.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PlayerType {
+    Batter,
+    #[serde(alias = "bat")]
+    Bat,
+    #[serde(alias = "hitter")]
+    Hitter,
+    Pitcher,
+    #[serde(alias = "pit")]
+    Pit,
+    #[serde(alias = "arm")]
+    Arm,
+}
+
+impl PlayerType {
+    fn is_batter(self) -> bool {
+        matches!(self, Self::Batter | Self::Bat | Self::Hitter)
+    }
+}
+
+impl std::fmt::Display for PlayerType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Batter | Self::Bat | Self::Hitter => write!(f, "batter"),
+            Self::Pitcher | Self::Pit | Self::Arm => write!(f, "pitcher"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetProjectionsArgs {
-    /// Player type: "batter" or "pitcher".
-    pub player_type: String,
+    /// Player type: "batter" or "pitcher" (also accepts "bat", "hitter", "pit", "arm").
+    pub player_type: PlayerType,
     /// Optional player name filter (case-insensitive substring match).
     pub player_name: Option<String>,
 }
@@ -380,7 +424,8 @@ impl FantraxServer {
             "status": "logged",
             "recommendation_id": id,
         });
-        Ok(response.to_string())
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
     /// Query the recommendation ledger.
@@ -420,7 +465,8 @@ impl FantraxServer {
             "id": args.id,
             "outcome": outcome_str,
         });
-        Ok(response.to_string())
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
     /// Ping --- health check tool.
@@ -434,7 +480,8 @@ impl FantraxServer {
             "version": env!("CARGO_PKG_VERSION"),
             "leagues": self.state.config.leagues.len(),
         });
-        Ok(response.to_string())
+        serde_json::to_string_pretty(&response)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
     /// Get today's probable starting pitchers with handedness info.
@@ -446,15 +493,7 @@ impl FantraxServer {
         &self,
         Parameters(args): Parameters<ProbableStartersArgs>,
     ) -> Result<String, ErrorData> {
-        let date = match &args.date {
-            Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|e| {
-                ErrorData::invalid_params(
-                    format!("invalid date format (use YYYY-MM-DD): {e}"),
-                    None,
-                )
-            })?,
-            None => chrono::Utc::now().date_naive(),
-        };
+        let date = parse_date_or_today(args.date.as_deref())?;
 
         let games = self
             .state
@@ -533,12 +572,7 @@ impl FantraxServer {
         Parameters(args): Parameters<PlayerSnippetArgs>,
     ) -> Result<String, ErrorData> {
         let date = match &args.date {
-            Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|e| {
-                ErrorData::invalid_params(
-                    format!("invalid date format (use YYYY-MM-DD): {e}"),
-                    None,
-                )
-            })?,
+            Some(d) => parse_date_or_today(Some(d))?,
             None => chrono::Utc::now().date_naive() - chrono::Duration::days(1),
         };
 
@@ -676,15 +710,7 @@ impl FantraxServer {
         &self,
         Parameters(args): Parameters<OptimizeLineupArgs>,
     ) -> Result<String, ErrorData> {
-        let date = match &args.date {
-            Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|e| {
-                ErrorData::invalid_params(
-                    format!("invalid date format (use YYYY-MM-DD): {e}"),
-                    None,
-                )
-            })?,
-            None => chrono::Utc::now().date_naive(),
-        };
+        let date = parse_date_or_today(args.date.as_deref())?;
 
         // 1. Fetch the roster from Fantrax.
         let roster = self
@@ -770,7 +796,7 @@ impl FantraxServer {
                 json!({
                     "player": r.player_name,
                     "player_id": r.player_id,
-                    "recommendation": r.recommendation.to_string(),
+                    "recommendation": r.verdict.to_string(),
                     "matchup_advantage": r.matchup_advantage.map(|a| a.to_string()),
                     "opposing_pitcher": r.opposing_pitcher,
                     "reason": r.reason,
@@ -796,15 +822,7 @@ impl FantraxServer {
         &self,
         Parameters(args): Parameters<BriefingArgs>,
     ) -> Result<String, ErrorData> {
-        let date = match &args.date {
-            Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|e| {
-                ErrorData::invalid_params(
-                    format!("invalid date format (use YYYY-MM-DD): {e}"),
-                    None,
-                )
-            })?,
-            None => chrono::Utc::now().date_naive(),
-        };
+        let date = parse_date_or_today(args.date.as_deref())?;
 
         // Determine which leagues to brief.
         let leagues: Vec<_> = match &args.league_id {
@@ -838,22 +856,33 @@ impl FantraxServer {
         let mut errors = Vec::new();
 
         for league in &leagues {
-            match briefing::generate_briefing(
-                league,
-                &args.team_id,
-                &args.period,
-                date,
-                &self.state.client,
-                &self.state.mlb,
-                &self.state.db,
-            )
-            .await
-            {
-                Ok(b) => briefings.push(b),
-                Err(e) => errors.push(json!({
-                    "league_id": league.id,
-                    "error": e.to_string(),
-                })),
+            match &args.team_id {
+                Some(team_id) => {
+                    match briefing::generate_briefing(
+                        league,
+                        team_id,
+                        &args.period,
+                        date,
+                        &self.state.client,
+                        &self.state.mlb,
+                        &self.state.db,
+                    )
+                    .await
+                    {
+                        Ok(b) => briefings.push(b),
+                        Err(e) => errors.push(json!({
+                            "league_id": league.id,
+                            "error": e.to_string(),
+                        })),
+                    }
+                }
+                None => {
+                    errors.push(json!({
+                        "league_id": league.id,
+                        "error": "team_id is required for roster-specific briefing layers; \
+                                  skipping this league",
+                    }));
+                }
             }
         }
 
@@ -879,69 +908,58 @@ impl FantraxServer {
         &self,
         Parameters(args): Parameters<GetProjectionsArgs>,
     ) -> Result<String, ErrorData> {
-        let player_type = args.player_type.to_lowercase();
         let name_filter = args.player_name.as_deref().map(|n| n.to_lowercase());
 
-        match player_type.as_str() {
-            "batter" | "bat" | "hitter" => {
-                let projections = self
-                    .state
-                    .projections
-                    .get_batter_projections()
-                    .await
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        if args.player_type.is_batter() {
+            let projections = self
+                .state
+                .projections
+                .get_batter_projections()
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-                let filtered: Vec<_> = match &name_filter {
-                    Some(filter) => projections
-                        .into_iter()
-                        .filter(|p| p.player_name.to_lowercase().contains(filter))
-                        .collect(),
-                    None => projections,
-                };
+            let filtered: Vec<_> = match &name_filter {
+                Some(filter) => projections
+                    .into_iter()
+                    .filter(|p| p.player_name.to_lowercase().contains(filter))
+                    .collect(),
+                None => projections,
+            };
 
-                let response = json!({
-                    "player_type": "batter",
-                    "source": self.state.config.projections.source,
-                    "total": filtered.len(),
-                    "projections": filtered,
-                });
+            let response = json!({
+                "player_type": "batter",
+                "source": self.state.config.projections.source,
+                "total": filtered.len(),
+                "projections": filtered,
+            });
 
-                serde_json::to_string_pretty(&response)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-            }
-            "pitcher" | "pit" | "arm" => {
-                let projections = self
-                    .state
-                    .projections
-                    .get_pitcher_projections()
-                    .await
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            serde_json::to_string_pretty(&response)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+        } else {
+            let projections = self
+                .state
+                .projections
+                .get_pitcher_projections()
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-                let filtered: Vec<_> = match &name_filter {
-                    Some(filter) => projections
-                        .into_iter()
-                        .filter(|p| p.player_name.to_lowercase().contains(filter))
-                        .collect(),
-                    None => projections,
-                };
+            let filtered: Vec<_> = match &name_filter {
+                Some(filter) => projections
+                    .into_iter()
+                    .filter(|p| p.player_name.to_lowercase().contains(filter))
+                    .collect(),
+                None => projections,
+            };
 
-                let response = json!({
-                    "player_type": "pitcher",
-                    "source": self.state.config.projections.source,
-                    "total": filtered.len(),
-                    "projections": filtered,
-                });
+            let response = json!({
+                "player_type": "pitcher",
+                "source": self.state.config.projections.source,
+                "total": filtered.len(),
+                "projections": filtered,
+            });
 
-                serde_json::to_string_pretty(&response)
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-            }
-            _ => Err(ErrorData::invalid_params(
-                format!(
-                    "invalid player_type '{}': expected 'batter' or 'pitcher'",
-                    args.player_type
-                ),
-                None,
-            )),
+            serde_json::to_string_pretty(&response)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))
         }
     }
 }

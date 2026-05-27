@@ -13,7 +13,7 @@ use crate::mlb::{Game, PitcherInfo, Player};
 pub struct StartSitRecommendation {
     pub player_name: String,
     pub player_id: String,
-    pub recommendation: Recommendation,
+    pub verdict: LineupVerdict,
     pub reason: String,
     pub opposing_pitcher: Option<String>,
     pub matchup_advantage: Option<MatchupAdvantage>,
@@ -23,13 +23,13 @@ pub struct StartSitRecommendation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
-pub enum Recommendation {
+pub enum LineupVerdict {
     Start,
     Sit,
     Monitor,
 }
 
-impl fmt::Display for Recommendation {
+impl fmt::Display for LineupVerdict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Start => write!(f, "start"),
@@ -48,8 +48,10 @@ pub enum MatchupAdvantage {
     Platoon,
     /// Same-side matchup (e.g. RHB vs RHP).
     Disadvantage,
-    /// Switch hitter or no handedness data available.
+    /// Switch hitter — no platoon concern.
     Neutral,
+    /// Handedness unknown for batter or pitcher — cannot determine matchup.
+    Unknown,
 }
 
 impl fmt::Display for MatchupAdvantage {
@@ -58,18 +60,9 @@ impl fmt::Display for MatchupAdvantage {
             Self::Platoon => write!(f, "platoon"),
             Self::Disadvantage => write!(f, "disadvantage"),
             Self::Neutral => write!(f, "neutral"),
+            Self::Unknown => write!(f, "unknown"),
         }
     }
-}
-
-/// Stub result for roster gap analysis.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CategoryGap {
-    pub category: String,
-    pub severity: String,
-    pub description: String,
 }
 
 // ─── Platoon logic ─────────────────────────────────────────────────────────
@@ -79,13 +72,13 @@ pub struct CategoryGap {
 /// - Switch hitters (`bat_side == "S"`) are always `Neutral`.
 /// - A batter facing same-side pitching (R vs R, L vs L) is `Disadvantage`.
 /// - Opposite-side matchup (R vs L, L vs R) is `Platoon`.
-/// - Unknown handedness results in `Neutral`.
+/// - Unknown handedness results in `Unknown`.
 pub fn matchup_advantage(bat_side: &str, pitch_hand: &str) -> MatchupAdvantage {
     match (bat_side, pitch_hand) {
-        ("S", _) | (_, "S") => MatchupAdvantage::Neutral,
+        ("S", _) => MatchupAdvantage::Neutral,
         ("R", "L") | ("L", "R") => MatchupAdvantage::Platoon,
         ("R", "R") | ("L", "L") => MatchupAdvantage::Disadvantage,
-        _ => MatchupAdvantage::Neutral,
+        _ => MatchupAdvantage::Unknown,
     }
 }
 
@@ -140,17 +133,18 @@ pub fn platoon_recommendations(
             ),
         };
 
-        let recommendation = match matchup {
-            Some(MatchupAdvantage::Platoon) => Recommendation::Start,
-            Some(MatchupAdvantage::Disadvantage) => Recommendation::Sit,
-            Some(MatchupAdvantage::Neutral) => Recommendation::Start,
-            None => Recommendation::Monitor,
+        let verdict = match matchup {
+            Some(MatchupAdvantage::Platoon) => LineupVerdict::Start,
+            Some(MatchupAdvantage::Disadvantage) => LineupVerdict::Sit,
+            Some(MatchupAdvantage::Neutral) => LineupVerdict::Start,
+            Some(MatchupAdvantage::Unknown) => LineupVerdict::Monitor,
+            None => LineupVerdict::Monitor,
         };
 
         recs.push(StartSitRecommendation {
             player_name: mlb_player.full_name.clone(),
             player_id: roster_player.player_id.clone(),
-            recommendation,
+            verdict,
             reason,
             opposing_pitcher,
             matchup_advantage: matchup,
@@ -228,6 +222,12 @@ fn format_platoon_reason(
                  no platoon concern"
             )
         }
+        MatchupAdvantage::Unknown => {
+            format!(
+                "{batter} ({bat_label}) vs {pitcher_name} ({pitch_label}) — handedness unknown, \
+                 monitor lineup card"
+            )
+        }
     }
 }
 
@@ -262,27 +262,10 @@ fn matchup_score(advantage: Option<MatchupAdvantage>) -> u8 {
     match advantage {
         Some(MatchupAdvantage::Platoon) => 3,
         Some(MatchupAdvantage::Neutral) => 2,
-        Some(MatchupAdvantage::Disadvantage) => 1,
+        Some(MatchupAdvantage::Unknown) => 1,
+        Some(MatchupAdvantage::Disadvantage) => 0,
         None => 0,
     }
-}
-
-// ─── Roster gap analysis (stub) ────────────────────────────────────────────
-
-/// Placeholder for roster gap analysis.
-///
-/// Given standings and scoring rules, this will identify which categories the
-/// team is weak in and return a ranked list of category gaps. Currently returns
-/// a stub response.
-#[allow(dead_code)]
-pub fn analyze_roster_gaps(_league_id: &str, _team_id: &str) -> Vec<CategoryGap> {
-    vec![CategoryGap {
-        category: "stub".into(),
-        severity: "info".into(),
-        description: "Roster gap analysis not yet implemented — will analyze \
-                      category strengths/weaknesses vs standings."
-            .into(),
-    }]
 }
 
 #[cfg(test)]
@@ -308,9 +291,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_hand_is_neutral() {
-        assert_eq!(matchup_advantage("R", "Unknown"), MatchupAdvantage::Neutral);
-        assert_eq!(matchup_advantage("Unknown", "R"), MatchupAdvantage::Neutral);
+    fn unknown_hand_is_unknown() {
+        assert_eq!(matchup_advantage("R", "Unknown"), MatchupAdvantage::Unknown);
+        assert_eq!(matchup_advantage("Unknown", "R"), MatchupAdvantage::Unknown);
     }
 
     #[test]
@@ -329,7 +312,7 @@ mod tests {
             StartSitRecommendation {
                 player_name: "A".into(),
                 player_id: "1".into(),
-                recommendation: Recommendation::Sit,
+                verdict: LineupVerdict::Sit,
                 reason: String::new(),
                 opposing_pitcher: None,
                 matchup_advantage: Some(MatchupAdvantage::Disadvantage),
@@ -337,7 +320,7 @@ mod tests {
             StartSitRecommendation {
                 player_name: "B".into(),
                 player_id: "2".into(),
-                recommendation: Recommendation::Start,
+                verdict: LineupVerdict::Start,
                 reason: String::new(),
                 opposing_pitcher: None,
                 matchup_advantage: Some(MatchupAdvantage::Platoon),
@@ -345,7 +328,7 @@ mod tests {
             StartSitRecommendation {
                 player_name: "C".into(),
                 player_id: "3".into(),
-                recommendation: Recommendation::Start,
+                verdict: LineupVerdict::Start,
                 reason: String::new(),
                 opposing_pitcher: None,
                 matchup_advantage: Some(MatchupAdvantage::Neutral),
@@ -358,12 +341,5 @@ mod tests {
         assert_eq!(top2[0].player_name, "B");
         // Neutral should be second.
         assert_eq!(top2[1].player_name, "C");
-    }
-
-    #[test]
-    fn roster_gaps_stub_returns_something() {
-        let gaps = analyze_roster_gaps("league1", "team1");
-        assert_eq!(gaps.len(), 1);
-        assert_eq!(gaps[0].category, "stub");
     }
 }

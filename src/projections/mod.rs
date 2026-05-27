@@ -1,4 +1,3 @@
-use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,36 +21,14 @@ const CSV_BASE: &str = "https://www.fangraphs.com/projections";
 // ─── Error type ────────────────────────────────────────────────────────────
 
 /// Errors that can occur when fetching FanGraphs projections.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ProjectionError {
     /// HTTP transport error from reqwest.
-    Http(reqwest::Error),
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
     /// The API/CSV returned data we couldn't parse.
+    #[error("FanGraphs parse error: {0}")]
     Parse(String),
-}
-
-impl fmt::Display for ProjectionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Http(e) => write!(f, "HTTP error: {e}"),
-            Self::Parse(msg) => write!(f, "FanGraphs parse error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for ProjectionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Http(e) => Some(e),
-            Self::Parse(_) => None,
-        }
-    }
-}
-
-impl From<reqwest::Error> for ProjectionError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::Http(e)
-    }
 }
 
 // ─── Projection types ─────────────────────────────────────────────────────

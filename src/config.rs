@@ -4,6 +4,19 @@ use std::path::{Path, PathBuf};
 use secrecy::SecretString;
 use serde::Deserialize;
 
+// ─── Error type ────────────────────────────────────────────────────────────
+
+/// Errors that can occur when loading configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// Failed to read the config file.
+    #[error("failed to read config file: {0}")]
+    Io(#[from] std::io::Error),
+    /// Failed to parse the config TOML.
+    #[error("failed to parse config: {0}")]
+    Parse(#[from] toml::de::Error),
+}
+
 pub struct Config {
     pub fantrax: FantraxConfig,
     pub leagues: Vec<LeagueConfig>,
@@ -91,6 +104,17 @@ pub enum LineupType {
     Worstball,
 }
 
+impl fmt::Display for LineupType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Daily => write!(f, "daily"),
+            Self::Weekly => write!(f, "weekly"),
+            Self::Bestball => write!(f, "bestball"),
+            Self::Worstball => write!(f, "worstball"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ProjectionsConfig {
     pub source: String,
@@ -120,7 +144,7 @@ fn dirs_fallback() -> Option<PathBuf> {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)?;
         let raw: RawConfig = toml::from_str(&contents)?;
         Ok(Config {

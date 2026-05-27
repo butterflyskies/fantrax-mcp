@@ -1,4 +1,3 @@
-use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +13,7 @@ const BASE_URL: &str = "https://statsapi.mlb.com/api/v1";
 
 // ─── Cache TTLs (seconds) ──────────────────────────────────────────────────
 
-const SCHEDULE_TTL: i64 = 6 * 3600; // 6 hours
+const SCHEDULE_TTL: i64 = 3600; // 1 hour for today's games
 const PLAYER_TTL: i64 = 7 * 24 * 3600; // 7 days
 const BOXSCORE_FINAL_TTL: i64 = 365 * 24 * 3600; // ~permanent (1 year)
 const BOXSCORE_LIVE_TTL: i64 = 300; // 5 min for in-progress games
@@ -22,36 +21,14 @@ const BOXSCORE_LIVE_TTL: i64 = 300; // 5 min for in-progress games
 // ─── Error type ────────────────────────────────────────────────────────────
 
 /// Errors that can occur when calling the MLB Stats API.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum MlbError {
     /// HTTP transport error from reqwest.
-    Http(reqwest::Error),
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
     /// The API returned a response we couldn't parse or that indicates failure.
+    #[error("MLB Stats API error: {0}")]
     Api(String),
-}
-
-impl fmt::Display for MlbError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Http(e) => write!(f, "HTTP error: {e}"),
-            Self::Api(msg) => write!(f, "MLB Stats API error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for MlbError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Http(e) => Some(e),
-            Self::Api(_) => None,
-        }
-    }
-}
-
-impl From<reqwest::Error> for MlbError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::Http(e)
-    }
 }
 
 // ─── Response types ────────────────────────────────────────────────────────
@@ -611,7 +588,7 @@ fn parse_pitcher_lines(team: &Value) -> Vec<PitcherLine> {
 
         // Only include players who actually pitched.
         let ip = val_str(stats, "inningsPitched");
-        if ip.is_empty() || ip == "0" {
+        if ip.is_empty() || ip.parse::<f64>().unwrap_or(0.0) <= 0.0 {
             continue;
         }
 

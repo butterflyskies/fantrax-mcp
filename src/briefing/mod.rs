@@ -57,43 +57,14 @@ pub enum Urgency {
 // ─── Error type ────────────────────────────────────────────────────────────
 
 /// Errors from the briefing pipeline.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum BriefingError {
-    Mlb(crate::mlb::MlbError),
-    Fantrax(crate::fantrax::FantraxError),
+    #[error("MLB error: {0}")]
+    Mlb(#[from] crate::mlb::MlbError),
+    #[error("Fantrax error: {0}")]
+    Fantrax(#[from] crate::fantrax::FantraxError),
+    #[error("briefing error: {0}")]
     Other(String),
-}
-
-impl std::fmt::Display for BriefingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Mlb(e) => write!(f, "MLB error: {e}"),
-            Self::Fantrax(e) => write!(f, "Fantrax error: {e}"),
-            Self::Other(msg) => write!(f, "briefing error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for BriefingError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Mlb(e) => Some(e),
-            Self::Fantrax(e) => Some(e),
-            Self::Other(_) => None,
-        }
-    }
-}
-
-impl From<crate::mlb::MlbError> for BriefingError {
-    fn from(e: crate::mlb::MlbError) -> Self {
-        Self::Mlb(e)
-    }
-}
-
-impl From<crate::fantrax::FantraxError> for BriefingError {
-    fn from(e: crate::fantrax::FantraxError) -> Self {
-        Self::Fantrax(e)
-    }
 }
 
 // ─── Pipeline ──────────────────────────────────────────────────────────────
@@ -359,13 +330,17 @@ fn is_injured_status(status: &str) -> bool {
 }
 
 fn format_injury_line(status: &str) -> String {
+    // Avoid redundant labels like "IL (IL10)" — just use the status directly
+    // when it already contains the category.
     let s = status.to_uppercase();
-    if s.contains("IL") {
-        format!("IL ({})", status)
+    if s.starts_with("IL") || s.starts_with("DTD") || s.starts_with("OUT") {
+        status.to_string()
+    } else if s.contains("IL") {
+        format!("IL ({status})")
     } else if s.contains("DTD") {
-        format!("DTD ({})", status)
+        format!("DTD ({status})")
     } else {
-        format!("OUT ({})", status)
+        format!("OUT ({status})")
     }
 }
 
@@ -421,7 +396,7 @@ async fn build_what_to_do(
 
             let recs = analysis::platoon_recommendations(&player_pairs, &games);
             for rec in &recs {
-                if rec.recommendation == analysis::Recommendation::Sit {
+                if rec.verdict == analysis::LineupVerdict::Sit {
                     items.push(ActionItem {
                         urgency: Urgency::Soon,
                         action: format!("Consider sitting {}", rec.player_name),
@@ -432,7 +407,7 @@ async fn build_what_to_do(
 
             // Flag players with no game today.
             for rec in &recs {
-                if rec.recommendation == analysis::Recommendation::Monitor {
+                if rec.verdict == analysis::LineupVerdict::Monitor {
                     items.push(ActionItem {
                         urgency: Urgency::Monitor,
                         action: format!("Check {} — may not have a game today", rec.player_name),

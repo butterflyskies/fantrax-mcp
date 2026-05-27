@@ -1,4 +1,3 @@
-use std::fmt;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -14,35 +13,34 @@ const BASE_URL: &str = "https://www.fantrax.com/fxea/general";
 // ─── Error type ─────────────────────────────────────────────────────────────
 
 /// Errors that can occur when calling the Fantrax API.
-#[derive(Debug)]
+///
+/// The `Http` variant deliberately strips the URL from reqwest errors to avoid
+/// leaking `userSecretId` query parameters in logs or error messages.
+#[derive(Debug, thiserror::Error)]
 pub enum FantraxError {
-    /// HTTP transport error from reqwest.
-    Http(reqwest::Error),
+    /// HTTP transport error from reqwest (URL stripped to protect credentials).
+    #[error("HTTP error: {0}")]
+    Http(String),
     /// The API returned a response we couldn't parse or that indicates failure.
+    #[error("Fantrax API error: {0}")]
     Api(String),
-}
-
-impl fmt::Display for FantraxError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Http(e) => write!(f, "HTTP error: {e}"),
-            Self::Api(msg) => write!(f, "Fantrax API error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for FantraxError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Http(e) => Some(e),
-            Self::Api(_) => None,
-        }
-    }
 }
 
 impl From<reqwest::Error> for FantraxError {
     fn from(e: reqwest::Error) -> Self {
-        Self::Http(e)
+        // Strip the URL from the error to avoid leaking userSecretId.
+        let sanitized = if let Some(status) = e.status() {
+            format!("HTTP {status}")
+        } else if e.is_timeout() {
+            "request timed out".to_string()
+        } else if e.is_connect() {
+            "connection failed".to_string()
+        } else if e.is_decode() {
+            "response decode error".to_string()
+        } else {
+            "request failed".to_string()
+        };
+        Self::Http(sanitized)
     }
 }
 

@@ -1,10 +1,14 @@
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Counter for probabilistic cache eviction (1 in 100 writes triggers cleanup).
+static SET_CACHED_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -27,7 +31,9 @@ pub struct Recommendation {
 /// SQLite-backed data layer for caching and the recommendation ledger.
 ///
 /// The inner connection is wrapped in a `Mutex` so `Database` is `Send + Sync`
-/// and can live inside an `Arc<AppState>` shared across async tasks.
+/// and can live inside an `Arc<AppState>` shared across async tasks. All public
+/// sync methods have async counterparts (suffixed `_async`) that run via
+/// `tokio::task::spawn_blocking` to avoid blocking the async runtime.
 pub struct Database {
     conn: Mutex<Connection>,
 }
@@ -104,6 +110,10 @@ impl Database {
             }
         };
         let age = Utc::now().signed_duration_since(fetched);
+        // Guard against clock skew: if age is negative, treat entry as stale.
+        if age.num_seconds() < 0 {
+            return None;
+        }
         if age.num_seconds() > ttl_seconds {
             return None;
         }
@@ -123,8 +133,14 @@ impl Database {
 
     /// Insert or update a cached value with the given TTL in seconds.
     pub fn set_cached(&self, key: &str, value: &Value, ttl_seconds: i64) {
+        let data = match serde_json::to_string(value) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(cache_key = key, error = %e, "failed to serialize cache value");
+                return;
+            }
+        };
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let data = serde_json::to_string(value).unwrap_or_default();
         let now = Utc::now().to_rfc3339();
         if let Err(e) = conn.execute(
             "INSERT OR REPLACE INTO cached_responses (key, data, fetched_at, ttl_seconds) \
@@ -132,6 +148,26 @@ impl Database {
             params![key, data, now, ttl_seconds],
         ) {
             tracing::warn!(cache_key = key, error = %e, "failed to write cache entry");
+        }
+
+        // Probabilistic cache eviction: clean up expired entries on ~1% of writes.
+        let count = SET_CACHED_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if count.is_multiple_of(100) {
+            self.evict_expired_locked(&conn);
+        }
+    }
+
+    /// Delete all expired cache entries. Expects the caller to already hold the lock.
+    fn evict_expired_locked(&self, conn: &Connection) {
+        let now = Utc::now().to_rfc3339();
+        match conn.execute(
+            "DELETE FROM cached_responses WHERE \
+             datetime(fetched_at, '+' || ttl_seconds || ' seconds') < datetime(?1)",
+            params![now],
+        ) {
+            Ok(n) if n > 0 => tracing::debug!(deleted = n, "evicted expired cache entries"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "failed to evict expired cache entries"),
         }
     }
 
@@ -217,7 +253,15 @@ impl Database {
         });
 
         match rows {
-            Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
+            Ok(mapped) => mapped
+                .filter_map(|r| match r {
+                    Ok(rec) => Some(rec),
+                    Err(e) => {
+                        tracing::warn!(league_id, error = %e, "failed to deserialize recommendation row");
+                        None
+                    }
+                })
+                .collect(),
             Err(e) => {
                 tracing::warn!(league_id, error = %e, "failed to query recommendations");
                 vec![]
@@ -226,13 +270,81 @@ impl Database {
     }
 
     /// Record an outcome for a previously logged recommendation.
+    ///
+    /// Returns an error if the recommendation ID does not exist.
     pub fn record_outcome(&self, id: i64, outcome: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let now = Utc::now().to_rfc3339();
-        conn.execute(
+        let rows_affected = conn.execute(
             "UPDATE recommendation_ledger SET outcome = ?1, outcome_date = ?2 WHERE id = ?3",
             params![outcome, now, id],
         )?;
+        if rows_affected == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(())
+    }
+}
+
+// ─── Async wrappers ────────────────────────────────────────────────────────
+
+/// Async wrappers that run sync DB operations on a blocking thread pool to
+/// avoid holding a `std::sync::Mutex` across await points.
+impl Database {
+    pub async fn get_cached_async(self: &Arc<Self>, key: String) -> Option<Value> {
+        let db = Arc::clone(self);
+        tokio::task::spawn_blocking(move || db.get_cached(&key))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn set_cached_async(self: &Arc<Self>, key: String, value: Value, ttl: i64) {
+        let db = Arc::clone(self);
+        let _ = tokio::task::spawn_blocking(move || db.set_cached(&key, &value, ttl)).await;
+    }
+
+    pub async fn log_recommendation_async(
+        self: &Arc<Self>,
+        agent_id: String,
+        league_id: String,
+        recommendation_type: String,
+        players: String,
+        reasoning: String,
+    ) -> Result<i64, rusqlite::Error> {
+        let db = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            db.log_recommendation(
+                &agent_id,
+                &league_id,
+                &recommendation_type,
+                &players,
+                &reasoning,
+            )
+        })
+        .await
+        .expect("spawn_blocking panicked")
+    }
+
+    pub async fn get_recommendations_async(
+        self: &Arc<Self>,
+        league_id: String,
+        agent_id: Option<String>,
+    ) -> Vec<Recommendation> {
+        let db = Arc::clone(self);
+        tokio::task::spawn_blocking(move || db.get_recommendations(&league_id, agent_id.as_deref()))
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn record_outcome_async(
+        self: &Arc<Self>,
+        id: i64,
+        outcome: String,
+    ) -> Result<(), rusqlite::Error> {
+        let db = Arc::clone(self);
+        tokio::task::spawn_blocking(move || db.record_outcome(id, &outcome))
+            .await
+            .expect("spawn_blocking panicked")
     }
 }
