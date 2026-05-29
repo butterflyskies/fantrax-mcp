@@ -2,6 +2,7 @@
 name = "fantrax-mcp"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 description = "Fantasy baseball MCP server for Fantrax — roster analysis, lineup optimization, and multi-agent recommendations"
 license = "MIT OR Apache-2.0"
 
