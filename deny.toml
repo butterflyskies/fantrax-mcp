@@ -1,0 +1,44 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+targets = []
+all-features = true
+
+# --- Advisories -----------------------------------------------------------
+[advisories]
+ignore = []
+
+# --- Licenses -------------------------------------------------------------
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+exceptions = [
+    # webpki-roots ships the Mozilla CA bundle under CDLA-Permissive-2.0
+    # (data license, not code). Pulled in transitively via reqwest's rustls-tls.
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
+
+# --- Bans ------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+# --- Sources ---------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
