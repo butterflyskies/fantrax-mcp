@@ -424,6 +424,45 @@ impl FantraxClient {
             raw: Some(resp),
         })
     }
+
+    /// Fetch team rosters enriched with player names from `getPlayerIds`.
+    ///
+    /// The roster endpoint does not include player names — only IDs. This
+    /// method calls both `getTeamRosters` and `getPlayerIds`, then resolves
+    /// names via a HashMap join.
+    #[instrument(skip(self), fields(endpoint = "getTeamRosters+getPlayerIds"))]
+    pub async fn get_team_rosters_enriched(
+        &self,
+        league_id: &LeagueId,
+        period: &str,
+    ) -> Result<Roster, FantraxError> {
+        let (mut roster, player_ids) = tokio::try_join!(
+            self.get_team_rosters(league_id, period),
+            self.get_player_ids("MLB"),
+        )?;
+
+        enrich_roster_names(&mut roster, &player_ids);
+        Ok(roster)
+    }
+}
+
+/// Resolve "Unknown" player names in a roster using the player ID→name map.
+fn enrich_roster_names(roster: &mut Roster, player_ids: &PlayerIds) {
+    let name_map: std::collections::HashMap<&str, &str> = player_ids
+        .players
+        .iter()
+        .map(|p| (p.id.as_str(), p.name.as_str()))
+        .collect();
+
+    for team in &mut roster.teams {
+        for player in &mut team.players {
+            if player.name == "Unknown"
+                && let Some(&name) = name_map.get(player.player_id.as_str())
+            {
+                player.name = name.to_string();
+            }
+        }
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -495,4 +534,132 @@ fn extract_roster_player(p: &Value) -> Option<RosterPlayer> {
         position,
         roster_status,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{LeagueId, PlayerId, TeamId};
+
+    fn make_roster_player(id: &str, name: &str, pos: &str) -> RosterPlayer {
+        RosterPlayer {
+            player_id: PlayerId::new(id),
+            name: name.to_string(),
+            position: pos.to_string(),
+            roster_status: "ACTIVE".to_string(),
+        }
+    }
+
+    fn make_roster(players: Vec<RosterPlayer>) -> Roster {
+        Roster {
+            league_id: LeagueId::new("test-league"),
+            period: "current".to_string(),
+            teams: vec![TeamRoster {
+                team_id: TeamId::new("01k3nunjmlznzs4q"),
+                team_name: "Giladelphia Gillies".to_string(),
+                players,
+            }],
+            raw: None,
+        }
+    }
+
+    fn make_player_ids(entries: &[(&str, &str)]) -> PlayerIds {
+        PlayerIds {
+            sport: "MLB".to_string(),
+            players: entries
+                .iter()
+                .map(|(id, name)| PlayerIdEntry {
+                    id: PlayerId::new(*id),
+                    name: name.to_string(),
+                })
+                .collect(),
+            raw: None,
+        }
+    }
+
+    #[test]
+    fn enrich_resolves_unknown_names() {
+        // Fixture: roster from live API — names absent, parsed as "Unknown"
+        let mut roster = make_roster(vec![
+            make_roster_player("03pit", "Unknown", "UT"),
+            make_roster_player("04ru7", "Unknown", "3B"),
+            make_roster_player("05y7s", "Unknown", "SP"),
+        ]);
+        let player_ids = make_player_ids(&[
+            ("03pit", "Shohei Ohtani"),
+            ("04ru7", "Manny Machado"),
+            ("05y7s", "Zack Wheeler"),
+        ]);
+
+        enrich_roster_names(&mut roster, &player_ids);
+
+        let names: Vec<&str> = roster.teams[0]
+            .players
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Shohei Ohtani", "Manny Machado", "Zack Wheeler"]
+        );
+    }
+
+    #[test]
+    fn enrich_preserves_existing_names() {
+        // If a player already has a name (not "Unknown"), enrichment should not overwrite it.
+        let mut roster = make_roster(vec![
+            make_roster_player("03pit", "Already Named", "UT"),
+            make_roster_player("04ru7", "Unknown", "3B"),
+        ]);
+        let player_ids = make_player_ids(&[("03pit", "Shohei Ohtani"), ("04ru7", "Manny Machado")]);
+
+        enrich_roster_names(&mut roster, &player_ids);
+
+        assert_eq!(roster.teams[0].players[0].name, "Already Named");
+        assert_eq!(roster.teams[0].players[1].name, "Manny Machado");
+    }
+
+    #[test]
+    fn enrich_leaves_unknown_when_id_not_in_map() {
+        // Player ID not in the player_ids map — name stays "Unknown".
+        let mut roster = make_roster(vec![make_roster_player("zzzzz", "Unknown", "OF")]);
+        let player_ids = make_player_ids(&[("03pit", "Shohei Ohtani")]);
+
+        enrich_roster_names(&mut roster, &player_ids);
+
+        assert_eq!(roster.teams[0].players[0].name, "Unknown");
+    }
+
+    #[test]
+    fn enrich_handles_empty_roster() {
+        let mut roster = make_roster(vec![]);
+        let player_ids = make_player_ids(&[("03pit", "Shohei Ohtani")]);
+
+        enrich_roster_names(&mut roster, &player_ids);
+
+        assert!(roster.teams[0].players.is_empty());
+    }
+
+    #[test]
+    fn enrich_handles_empty_player_ids() {
+        let mut roster = make_roster(vec![make_roster_player("03pit", "Unknown", "UT")]);
+        let player_ids = make_player_ids(&[]);
+
+        enrich_roster_names(&mut roster, &player_ids);
+
+        assert_eq!(roster.teams[0].players[0].name, "Unknown");
+    }
+
+    #[test]
+    fn extract_roster_player_without_name_field() {
+        // Simulates the live API response: player entry with ID but no name key.
+        let json: Value = serde_json::json!({
+            "playerId": "03pit",
+            "position": "UT",
+            "rosterStatus": "ACTIVE"
+        });
+        let player = extract_roster_player(&json).unwrap();
+        assert_eq!(player.player_id.as_str(), "03pit");
+        assert_eq!(player.name, "Unknown");
+    }
 }
