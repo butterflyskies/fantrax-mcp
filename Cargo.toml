@@ -1,6 +1,6 @@
 [package]
 name = "fantrax-mcp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Fantasy baseball MCP server for Fantrax — roster analysis, lineup optimization, and multi-agent recommendations"
