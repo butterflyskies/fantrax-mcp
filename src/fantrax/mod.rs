@@ -275,35 +275,16 @@ impl FantraxClient {
             .or_else(|| resp.get("data").and_then(|d| d.get("rosters")));
 
         let teams = if let Some(teams_arr) = teams_value.and_then(|v| v.as_array()) {
+            // Array of team objects (some API versions)
             teams_arr
                 .iter()
-                .filter_map(|team| {
-                    let team_id: TeamId = team
-                        .get("teamId")
-                        .or_else(|| team.get("team_id"))
-                        .and_then(|v| v.as_str())
-                        .map(TeamId::new)?;
-                    let team_name = team
-                        .get("teamName")
-                        .or_else(|| team.get("team_name"))
-                        .or_else(|| team.get("name"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                        .unwrap_or_else(|| "Unknown".to_string());
-
-                    let players = team
-                        .get("players")
-                        .or_else(|| team.get("roster"))
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(extract_roster_player).collect())
-                        .unwrap_or_default();
-
-                    Some(TeamRoster {
-                        team_id,
-                        team_name,
-                        players,
-                    })
-                })
+                .filter_map(|team| extract_team_roster(team, None))
+                .collect()
+        } else if let Some(teams_obj) = teams_value.and_then(|v| v.as_object()) {
+            // Object keyed by team ID (Fantrax beta API format)
+            teams_obj
+                .iter()
+                .filter_map(|(tid, team)| extract_team_roster(team, Some(tid)))
                 .collect()
         } else {
             vec![]
@@ -446,6 +427,38 @@ impl FantraxClient {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+fn extract_team_roster(team: &Value, key_as_id: Option<&str>) -> Option<TeamRoster> {
+    let team_id: TeamId = if let Some(tid) = key_as_id {
+        TeamId::new(tid)
+    } else {
+        team.get("teamId")
+            .or_else(|| team.get("team_id"))
+            .and_then(|v| v.as_str())
+            .map(TeamId::new)?
+    };
+    let team_name = team
+        .get("teamName")
+        .or_else(|| team.get("team_name"))
+        .or_else(|| team.get("name"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let players = team
+        .get("rosterItems")
+        .or_else(|| team.get("players"))
+        .or_else(|| team.get("roster"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(extract_roster_player).collect())
+        .unwrap_or_default();
+
+    Some(TeamRoster {
+        team_id,
+        team_name,
+        players,
+    })
+}
 
 fn extract_roster_player(p: &Value) -> Option<RosterPlayer> {
     let player_id: PlayerId = p
