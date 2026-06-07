@@ -598,7 +598,10 @@ mod tests {
             .iter()
             .map(|p| p.name.as_str())
             .collect();
-        assert_eq!(names, vec!["Shohei Ohtani", "Manny Machado", "Zack Wheeler"]);
+        assert_eq!(
+            names,
+            vec!["Shohei Ohtani", "Manny Machado", "Zack Wheeler"]
+        );
     }
 
     #[test]
@@ -608,10 +611,7 @@ mod tests {
             make_roster_player("03pit", "Already Named", "UT"),
             make_roster_player("04ru7", "Unknown", "3B"),
         ]);
-        let player_ids = make_player_ids(&[
-            ("03pit", "Shohei Ohtani"),
-            ("04ru7", "Manny Machado"),
-        ]);
+        let player_ids = make_player_ids(&[("03pit", "Shohei Ohtani"), ("04ru7", "Manny Machado")]);
 
         enrich_roster_names(&mut roster, &player_ids);
 
@@ -622,9 +622,7 @@ mod tests {
     #[test]
     fn enrich_leaves_unknown_when_id_not_in_map() {
         // Player ID not in the player_ids map — name stays "Unknown".
-        let mut roster = make_roster(vec![
-            make_roster_player("zzzzz", "Unknown", "OF"),
-        ]);
+        let mut roster = make_roster(vec![make_roster_player("zzzzz", "Unknown", "OF")]);
         let player_ids = make_player_ids(&[("03pit", "Shohei Ohtani")]);
 
         enrich_roster_names(&mut roster, &player_ids);
@@ -644,9 +642,7 @@ mod tests {
 
     #[test]
     fn enrich_handles_empty_player_ids() {
-        let mut roster = make_roster(vec![
-            make_roster_player("03pit", "Unknown", "UT"),
-        ]);
+        let mut roster = make_roster(vec![make_roster_player("03pit", "Unknown", "UT")]);
         let player_ids = make_player_ids(&[]);
 
         enrich_roster_names(&mut roster, &player_ids);
