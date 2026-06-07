@@ -1,6 +1,8 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+
+use parking_lot::Mutex;
 
 use chrono::Utc;
 use rusqlite::{Connection, params};
@@ -32,18 +34,15 @@ pub struct Recommendation {
 
 /// SQLite-backed data layer for caching and the recommendation ledger.
 ///
-/// The inner connection is wrapped in a `Mutex` so `Database` is `Send + Sync`
-/// and can live inside an `Arc<AppState>` shared across async tasks. All public
-/// sync methods have async counterparts (suffixed `_async`) that run via
-/// `tokio::task::spawn_blocking` to avoid blocking the async runtime.
+/// The inner connection is wrapped in a `parking_lot::Mutex` so `Database` is
+/// `Send + Sync` and can live inside an `Arc<AppState>` shared across async
+/// tasks. All public sync methods have async counterparts (suffixed `_async`)
+/// that run via `tokio::task::spawn_blocking` to avoid blocking the async
+/// runtime.
 ///
-/// # Panics
-///
-/// All mutex acquisitions use `expect("db mutex poisoned")`. This is an
-/// intentional fail-fast strategy: a poisoned mutex means a previous holder
-/// panicked, leaving the database connection in an unknown state. Continuing
-/// with a potentially corrupted connection would be worse than crashing, so
-/// we treat poison as unrecoverable.
+/// `parking_lot::Mutex` does not poison on panic, so lock acquisition is
+/// infallible and cancel-safe: dropping a `spawn_blocking` handle cannot
+/// leave the mutex in a poisoned state.
 pub struct Database {
     conn: Mutex<Connection>,
 }
@@ -68,7 +67,7 @@ impl Database {
     }
 
     fn init_schema(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.conn.lock();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS cached_responses (
                 key TEXT PRIMARY KEY,
@@ -95,7 +94,7 @@ impl Database {
     }
 
     pub fn health_check(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.conn.lock();
         conn.query_row("SELECT 1", [], |_| Ok(()))
     }
 
@@ -103,7 +102,7 @@ impl Database {
 
     /// Get a cached value by key. Returns `None` if missing or expired.
     pub fn get_cached(&self, key: &str) -> Option<Value> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.conn.lock();
         let result: Result<(String, String, i64), _> = conn.query_row(
             "SELECT data, fetched_at, ttl_seconds FROM cached_responses WHERE key = ?1",
             params![key],
@@ -155,7 +154,7 @@ impl Database {
                 return;
             }
         };
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         if let Err(e) = conn.execute(
             "INSERT OR REPLACE INTO cached_responses (key, data, fetched_at, ttl_seconds) \
@@ -197,7 +196,7 @@ impl Database {
         players: &str,
         reasoning: &str,
     ) -> Result<i64, rusqlite::Error> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO recommendation_ledger \
@@ -221,7 +220,7 @@ impl Database {
         league_id: &LeagueId,
         agent_id: Option<&str>,
     ) -> Vec<Recommendation> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.conn.lock();
 
         let (sql, bind_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match agent_id {
             Some(aid) => (
@@ -291,7 +290,7 @@ impl Database {
     ///
     /// Returns an error if the recommendation ID does not exist.
     pub fn record_outcome(&self, id: i64, outcome: &str) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         let rows_affected = conn.execute(
             "UPDATE recommendation_ledger SET outcome = ?1, outcome_date = ?2 WHERE id = ?3",
@@ -306,8 +305,11 @@ impl Database {
 
 // ─── Async wrappers ────────────────────────────────────────────────────────
 
-/// Async wrappers that run sync DB operations on a blocking thread pool to
-/// avoid holding a `std::sync::Mutex` across await points.
+/// Async wrappers that run sync DB operations on a blocking thread pool.
+///
+/// Each operation runs inside `spawn_blocking`, making it a Tokio task: if the
+/// caller's future is cancelled (dropped), the DB operation still runs to
+/// completion, preserving data integrity.
 impl Database {
     pub async fn get_cached_async(self: &Arc<Self>, key: String) -> Option<Value> {
         let db = Arc::clone(self);
@@ -443,7 +445,7 @@ mod tests {
         // Insert an entry with a far-past fetched_at and a short TTL so the
         // eviction SQL (which uses datetime arithmetic) sees it as expired.
         {
-            let conn = db.conn.lock().expect("db mutex poisoned");
+            let conn = db.conn.lock();
             let past = "2000-01-01T00:00:00+00:00";
             conn.execute(
                 "INSERT OR REPLACE INTO cached_responses (key, data, fetched_at, ttl_seconds) \
@@ -457,12 +459,12 @@ mod tests {
         assert!(db.get_cached("stale_key").is_none());
 
         // Manually trigger eviction.
-        let conn = db.conn.lock().expect("db mutex poisoned");
+        let conn = db.conn.lock();
         db.evict_expired_locked(&conn);
         drop(conn);
 
         // Verify the row was actually deleted from the table.
-        let conn = db.conn.lock().expect("db mutex poisoned");
+        let conn = db.conn.lock();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM cached_responses WHERE key = 'stale_key'",
@@ -480,7 +482,7 @@ mod tests {
 
         db.set_cached("live_key", &value, 3600);
 
-        let conn = db.conn.lock().expect("db mutex poisoned");
+        let conn = db.conn.lock();
         db.evict_expired_locked(&conn);
         drop(conn);
 
@@ -496,7 +498,7 @@ mod tests {
 
         // Insert a stale entry.
         {
-            let conn = db.conn.lock().expect("db mutex poisoned");
+            let conn = db.conn.lock();
             let past = "2000-01-01T00:00:00+00:00";
             conn.execute(
                 "INSERT OR REPLACE INTO cached_responses (key, data, fetched_at, ttl_seconds) \
@@ -520,7 +522,7 @@ mod tests {
         db.set_cached("trigger", &serde_json::json!("trigger"), 3600);
 
         // The stale entry should have been cleaned up.
-        let conn = db.conn.lock().expect("db mutex poisoned");
+        let conn = db.conn.lock();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM cached_responses WHERE key = 'stale_prob'",
