@@ -424,6 +424,41 @@ impl FantraxClient {
             raw: Some(resp),
         })
     }
+
+    /// Fetch team rosters enriched with player names from `getPlayerIds`.
+    ///
+    /// The roster endpoint does not include player names — only IDs. This
+    /// method calls both `getTeamRosters` and `getPlayerIds`, then resolves
+    /// names via a HashMap join.
+    #[instrument(skip(self), fields(endpoint = "getTeamRosters+getPlayerIds"))]
+    pub async fn get_team_rosters_enriched(
+        &self,
+        league_id: &LeagueId,
+        period: &str,
+    ) -> Result<Roster, FantraxError> {
+        let (mut roster, player_ids) = tokio::try_join!(
+            self.get_team_rosters(league_id, period),
+            self.get_player_ids("MLB"),
+        )?;
+
+        let name_map: std::collections::HashMap<&str, &str> = player_ids
+            .players
+            .iter()
+            .map(|p| (p.id.as_str(), p.name.as_str()))
+            .collect();
+
+        for team in &mut roster.teams {
+            for player in &mut team.players {
+                if player.name == "Unknown" {
+                    if let Some(&name) = name_map.get(player.player_id.as_str()) {
+                        player.name = name.to_string();
+                    }
+                }
+            }
+        }
+
+        Ok(roster)
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

@@ -326,7 +326,7 @@ impl FantraxServer {
                 || async {
                     self.state
                         .client
-                        .get_team_rosters(&args.league_id, &args.period)
+                        .get_team_rosters_enriched(&args.league_id, &args.period)
                         .await
                         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
                 },
@@ -705,11 +705,11 @@ impl FantraxServer {
     ) -> Result<String, ErrorData> {
         let date = parse_date_or_today(args.date.as_deref())?;
 
-        // 1. Fetch the roster from Fantrax.
+        // 1. Fetch the roster from Fantrax (enriched with player names).
         let roster = self
             .state
             .client
-            .get_team_rosters(&args.league_id, &args.period)
+            .get_team_rosters_enriched(&args.league_id, &args.period)
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
