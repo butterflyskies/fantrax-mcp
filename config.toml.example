@@ -1,0 +1,73 @@
+# fantrax-mcp configuration
+#
+# Copy this file to config.toml and fill in your values.
+# config.toml is gitignored — never commit credentials.
+
+[fantrax]
+# Your Fantrax user secret ID. Found in Fantrax account settings under
+# "API Access" or extracted from authenticated API requests. This is used
+# as a query parameter to authenticate against the Fantrax beta API.
+# REQUIRED — the server will not start without it.
+user_secret_id = "YOUR_SECRET_ID_HERE"
+
+# ─── Leagues ────────────────────────────────────────────────────────────────
+#
+# Define one or more [[leagues]] entries. Use `list_leagues` MCP tool (or the
+# Fantrax getLeagues endpoint) to discover your league IDs.
+#
+# Fields:
+#   id          — Fantrax league ID string (required)
+#   name        — Human-readable name (required)
+#   league_type — Scoring format: h2h | roto | hybrid | custom (required)
+#   lineup      — Lineup cadence: daily | weekly | bestball | worstball (required)
+#   keeper      — Is this a keeper league? (optional, default: false)
+
+[[leagues]]
+id = "abc123"
+name = "Main League"
+league_type = "h2h"
+lineup = "daily"
+keeper = false
+
+# [[leagues]]
+# id = "def456"
+# name = "Keeper League"
+# league_type = "roto"
+# lineup = "daily"
+# keeper = true
+
+# [[leagues]]
+# id = "ghi789"
+# name = "Weekly H2H"
+# league_type = "h2h"
+# lineup = "weekly"
+# keeper = false
+
+# [[leagues]]
+# id = "jkl012"
+# name = "Best Ball"
+# league_type = "custom"
+# lineup = "bestball"
+# keeper = false
+
+[projections]
+# Projection system to use from FanGraphs.
+# Options: steamer, zips, atc, thebat, thebatx
+source = "steamer"
+
+# How often to refresh cached projections, in hours.
+# FanGraphs updates projections roughly once per day.
+refresh_hours = 24
+
+[server]
+# Address to bind to. Use "0.0.0.0" to listen on all interfaces
+# (required for Docker / container deployments).
+# Default: "127.0.0.1" (localhost only)
+bind_addr = "127.0.0.1"
+
+# Port for the MCP HTTP server.
+port = 3001
+
+# Path to the SQLite database file. Tilde (~) expands to $HOME.
+# Parent directories are created automatically if they don't exist.
+db_path = "~/.local/share/fantrax-mcp/fantrax.db"

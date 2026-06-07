@@ -1,0 +1,29 @@
+[package]
+name = "fantrax-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Fantasy baseball MCP server for Fantrax — roster analysis, lineup optimization, and multi-agent recommendations"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+mcp-session = "0.2"
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "1", features = ["server", "macros", "transport-streamable-http-server"] }
+schemars = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
