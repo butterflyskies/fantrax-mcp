@@ -35,6 +35,9 @@ fn parse_date_or_today(date: Option<&str>) -> Result<NaiveDate, ErrorData> {
 // ─── Tool argument structs ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NoArgs {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LeagueIdArgs {
     /// The Fantrax league ID.
     pub league_id: LeagueId,
@@ -275,7 +278,7 @@ impl FantraxServer {
         name = "list_leagues",
         description = "List all fantasy baseball leagues for the configured Fantrax user."
     )]
-    async fn list_leagues(&self, _params: Parameters<()>) -> Result<String, ErrorData> {
+    async fn list_leagues(&self, _params: Parameters<NoArgs>) -> Result<String, ErrorData> {
         self.state
             .cached_fetch("leagues".into(), 900, || async {
                 self.state
@@ -464,7 +467,7 @@ impl FantraxServer {
         name = "ping",
         description = "Health check. Returns server version and configured league count."
     )]
-    async fn ping(&self, _params: Parameters<()>) -> Result<String, ErrorData> {
+    async fn ping(&self, _params: Parameters<NoArgs>) -> Result<String, ErrorData> {
         let response = json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
@@ -968,5 +971,39 @@ impl ServerHandler for FantraxServer {
              `get_projections` for FanGraphs WAR-sorted projections for batters or pitchers."
                 .to_string(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MCP requires every tool's inputSchema to have `type: "object"`.
+    /// `Parameters<()>` generates `type: "null"` which breaks Claude Code's
+    /// schema validator. This test catches the trap at build time.
+    #[test]
+    fn all_tool_arg_schemas_are_object_type() {
+        fn assert_object_schema<T: schemars::JsonSchema>(name: &str) {
+            let schema = schemars::schema_for!(T);
+            let obj = serde_json::to_value(&schema).unwrap();
+            assert_eq!(
+                obj.get("type").and_then(|t| t.as_str()),
+                Some("object"),
+                "tool arg struct {name} has non-object schema type: {obj}"
+            );
+        }
+
+        assert_object_schema::<NoArgs>("NoArgs");
+        assert_object_schema::<LeagueIdArgs>("LeagueIdArgs");
+        assert_object_schema::<RosterArgs>("RosterArgs");
+        assert_object_schema::<PlayerIdsArgs>("PlayerIdsArgs");
+        assert_object_schema::<LogRecommendationArgs>("LogRecommendationArgs");
+        assert_object_schema::<QueryLedgerArgs>("QueryLedgerArgs");
+        assert_object_schema::<RecordOutcomeArgs>("RecordOutcomeArgs");
+        assert_object_schema::<ProbableStartersArgs>("ProbableStartersArgs");
+        assert_object_schema::<PlayerSnippetArgs>("PlayerSnippetArgs");
+        assert_object_schema::<OptimizeLineupArgs>("OptimizeLineupArgs");
+        assert_object_schema::<BriefingArgs>("BriefingArgs");
+        assert_object_schema::<GetProjectionsArgs>("GetProjectionsArgs");
     }
 }
