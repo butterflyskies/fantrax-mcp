@@ -36,6 +36,14 @@ pub struct Recommendation {
 /// and can live inside an `Arc<AppState>` shared across async tasks. All public
 /// sync methods have async counterparts (suffixed `_async`) that run via
 /// `tokio::task::spawn_blocking` to avoid blocking the async runtime.
+///
+/// # Panics
+///
+/// All mutex acquisitions use `expect("db mutex poisoned")`. This is an
+/// intentional fail-fast strategy: a poisoned mutex means a previous holder
+/// panicked, leaving the database connection in an unknown state. Continuing
+/// with a potentially corrupted connection would be worse than crashing, so
+/// we treat poison as unrecoverable.
 pub struct Database {
     conn: Mutex<Connection>,
 }
@@ -356,5 +364,299 @@ impl Database {
         tokio::task::spawn_blocking(move || db.record_outcome(id, &outcome))
             .await
             .expect("spawn_blocking panicked")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Create a fresh in-memory-like database in a temp directory.
+    fn test_db() -> (Database, TempDir) {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let path = dir.path().join("test.db");
+        let db = Database::open(&path).expect("failed to open test db");
+        (db, dir)
+    }
+
+    // ── Health check ───────────────────────────────────────────────────
+
+    #[test]
+    fn health_check_succeeds() {
+        let (db, _dir) = test_db();
+        db.health_check().expect("health check should succeed");
+    }
+
+    // ── Cache layer ────────────────────────────────────────────────────
+
+    #[test]
+    fn cache_miss_returns_none() {
+        let (db, _dir) = test_db();
+        assert!(db.get_cached("nonexistent").is_none());
+    }
+
+    #[test]
+    fn cache_set_then_get() {
+        let (db, _dir) = test_db();
+        let value = serde_json::json!({"hello": "world"});
+        db.set_cached("key1", &value, 3600);
+
+        let cached = db.get_cached("key1").expect("should find cached value");
+        assert_eq!(cached, value);
+    }
+
+    #[test]
+    fn cache_overwrite() {
+        let (db, _dir) = test_db();
+        let v1 = serde_json::json!(1);
+        let v2 = serde_json::json!(2);
+
+        db.set_cached("key", &v1, 3600);
+        db.set_cached("key", &v2, 3600);
+
+        let cached = db.get_cached("key").expect("should find cached value");
+        assert_eq!(cached, v2);
+    }
+
+    #[test]
+    fn cache_expired_returns_none() {
+        let (db, _dir) = test_db();
+        let value = serde_json::json!("ephemeral");
+
+        // Insert with 0 TTL — immediately expired.
+        db.set_cached("expire_me", &value, 0);
+        // The entry should be considered expired on the next read.
+        // TTL=0 means age (>= 0 seconds) > 0 is false for immediate reads,
+        // but the check is `age.num_seconds() > ttl_seconds` (strict >),
+        // so age=0, ttl=0 => 0 > 0 is false — still valid.
+        // Use TTL=-1 to guarantee expiry (negative TTL is nonsensical but
+        // exercises the boundary).
+        db.set_cached("expire_me_neg", &value, -1);
+        assert!(db.get_cached("expire_me_neg").is_none());
+    }
+
+    #[test]
+    fn evict_expired_removes_stale_entries() {
+        let (db, _dir) = test_db();
+
+        // Insert an entry with a far-past fetched_at and a short TTL so the
+        // eviction SQL (which uses datetime arithmetic) sees it as expired.
+        {
+            let conn = db.conn.lock().expect("db mutex poisoned");
+            let past = "2000-01-01T00:00:00+00:00";
+            conn.execute(
+                "INSERT OR REPLACE INTO cached_responses (key, data, fetched_at, ttl_seconds) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["stale_key", "\"stale\"", past, 1],
+            )
+            .unwrap();
+        }
+
+        // Verify our Rust-side check also considers it expired.
+        assert!(db.get_cached("stale_key").is_none());
+
+        // Manually trigger eviction.
+        let conn = db.conn.lock().expect("db mutex poisoned");
+        db.evict_expired_locked(&conn);
+        drop(conn);
+
+        // Verify the row was actually deleted from the table.
+        let conn = db.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cached_responses WHERE key = 'stale_key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "stale entry should have been evicted");
+    }
+
+    #[test]
+    fn evict_does_not_remove_live_entries() {
+        let (db, _dir) = test_db();
+        let value = serde_json::json!("alive");
+
+        db.set_cached("live_key", &value, 3600);
+
+        let conn = db.conn.lock().expect("db mutex poisoned");
+        db.evict_expired_locked(&conn);
+        drop(conn);
+
+        assert!(db.get_cached("live_key").is_some());
+    }
+
+    #[test]
+    fn probabilistic_eviction_triggers_on_100th_write() {
+        let (db, _dir) = test_db();
+
+        // Reset the counter to just before a multiple of 100.
+        SET_CACHED_COUNTER.store(99, Ordering::Relaxed);
+
+        // Insert a stale entry.
+        {
+            let conn = db.conn.lock().expect("db mutex poisoned");
+            let past = "2000-01-01T00:00:00+00:00";
+            conn.execute(
+                "INSERT OR REPLACE INTO cached_responses (key, data, fetched_at, ttl_seconds) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params!["stale_prob", "\"old\"", past, 1],
+            )
+            .unwrap();
+        }
+
+        // This write will be the 100th (counter was 99, fetch_add makes it 100
+        // and returns 99 — wait, is_multiple_of checks the returned value).
+        // Actually: fetch_add(1) returns old value. 99 is not a multiple of 100.
+        // So we need counter at 99, then the *next* set_cached increments to 100
+        // and returns 99. is_multiple_of(100) on 99 is false.
+        // We need old value = 0, 100, 200... So store 0-1 = we need fetch_add to
+        // return a multiple of 100. Store 99 => returns 99, not multiple. Store 100
+        // => returns 100, is_multiple_of(100) = true.
+        SET_CACHED_COUNTER.store(100, Ordering::Relaxed);
+
+        // This set_cached call should trigger eviction (counter returns 100).
+        db.set_cached("trigger", &serde_json::json!("trigger"), 3600);
+
+        // The stale entry should have been cleaned up.
+        let conn = db.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cached_responses WHERE key = 'stale_prob'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "probabilistic eviction should have cleaned stale entry"
+        );
+    }
+
+    // ── Recommendation ledger ──────────────────────────────────────────
+
+    #[test]
+    fn log_and_query_recommendation() {
+        let (db, _dir) = test_db();
+        let league = LeagueId::new("test-league");
+
+        let id = db
+            .log_recommendation("ariadne", &league, "pickup", "[\"p1\"]", "looks good")
+            .expect("should log recommendation");
+        assert!(id > 0);
+
+        let recs = db.get_recommendations(&league, None);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].id, id);
+        assert_eq!(recs[0].agent_id, "ariadne");
+        assert_eq!(recs[0].recommendation_type, "pickup");
+        assert_eq!(recs[0].players, "[\"p1\"]");
+        assert_eq!(recs[0].reasoning, "looks good");
+        assert!(recs[0].outcome.is_none());
+    }
+
+    #[test]
+    fn query_filters_by_agent() {
+        let (db, _dir) = test_db();
+        let league = LeagueId::new("league-1");
+
+        db.log_recommendation("alice", &league, "start", "[\"p1\"]", "reason a")
+            .unwrap();
+        db.log_recommendation("bob", &league, "sit", "[\"p2\"]", "reason b")
+            .unwrap();
+
+        let alice_recs = db.get_recommendations(&league, Some("alice"));
+        assert_eq!(alice_recs.len(), 1);
+        assert_eq!(alice_recs[0].agent_id, "alice");
+
+        let bob_recs = db.get_recommendations(&league, Some("bob"));
+        assert_eq!(bob_recs.len(), 1);
+        assert_eq!(bob_recs[0].agent_id, "bob");
+
+        let all_recs = db.get_recommendations(&league, None);
+        assert_eq!(all_recs.len(), 2);
+    }
+
+    #[test]
+    fn query_filters_by_league() {
+        let (db, _dir) = test_db();
+        let league_a = LeagueId::new("league-a");
+        let league_b = LeagueId::new("league-b");
+
+        db.log_recommendation("agent", &league_a, "pickup", "[]", "r1")
+            .unwrap();
+        db.log_recommendation("agent", &league_b, "drop", "[]", "r2")
+            .unwrap();
+
+        assert_eq!(db.get_recommendations(&league_a, None).len(), 1);
+        assert_eq!(db.get_recommendations(&league_b, None).len(), 1);
+    }
+
+    #[test]
+    fn record_outcome_updates_recommendation() {
+        let (db, _dir) = test_db();
+        let league = LeagueId::new("test-league");
+
+        let id = db
+            .log_recommendation("agent", &league, "start", "[\"p1\"]", "solid matchup")
+            .unwrap();
+
+        db.record_outcome(id, "win").expect("should record outcome");
+
+        let recs = db.get_recommendations(&league, None);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].outcome.as_deref(), Some("win"));
+        assert!(recs[0].outcome_date.is_some());
+    }
+
+    #[test]
+    fn record_outcome_nonexistent_id_fails() {
+        let (db, _dir) = test_db();
+        let result = db.record_outcome(99999, "loss");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn multiple_recommendations_ordered_by_created_desc() {
+        let (db, _dir) = test_db();
+        let league = LeagueId::new("test-league");
+
+        let id1 = db
+            .log_recommendation("agent", &league, "pickup", "[\"p1\"]", "first")
+            .unwrap();
+        let id2 = db
+            .log_recommendation("agent", &league, "drop", "[\"p2\"]", "second")
+            .unwrap();
+
+        let recs = db.get_recommendations(&league, None);
+        assert_eq!(recs.len(), 2);
+        // Most recent first.
+        assert_eq!(recs[0].id, id2);
+        assert_eq!(recs[1].id, id1);
+    }
+
+    // ── Schema initialization ──────────────────────────────────────────
+
+    #[test]
+    fn open_creates_parent_directories() {
+        let dir = TempDir::new().unwrap();
+        let deep_path = dir.path().join("a").join("b").join("c").join("test.db");
+        let db = Database::open(&deep_path).expect("should create parent dirs and open");
+        db.health_check().unwrap();
+    }
+
+    #[test]
+    fn open_twice_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+
+        let db1 = Database::open(&path).unwrap();
+        db1.set_cached("key", &serde_json::json!("v"), 3600);
+        drop(db1);
+
+        let db2 = Database::open(&path).unwrap();
+        let cached = db2.get_cached("key");
+        assert_eq!(cached, Some(serde_json::json!("v")));
     }
 }

@@ -17,7 +17,7 @@ use crate::{
     fantrax::FantraxClient,
     mlb::MlbClient,
     projections::ProjectionClient,
-    types::{LeagueId, TeamId},
+    types::{LeagueId, PlayerId, TeamId},
 };
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -109,8 +109,8 @@ pub struct LogRecommendationArgs {
     pub league_id: LeagueId,
     /// Type of recommendation: pickup, drop, start, sit, waiver.
     pub recommendation_type: RecommendationType,
-    /// JSON array of player IDs involved.
-    pub players: String,
+    /// Player IDs involved in this recommendation.
+    pub players: Vec<PlayerId>,
     /// The agent's rationale for this recommendation.
     pub reasoning: String,
 }
@@ -177,29 +177,23 @@ pub struct BriefingArgs {
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PlayerType {
+    #[serde(alias = "bat", alias = "hitter")]
     Batter,
-    #[serde(alias = "bat")]
-    Bat,
-    #[serde(alias = "hitter")]
-    Hitter,
+    #[serde(alias = "pit", alias = "arm")]
     Pitcher,
-    #[serde(alias = "pit")]
-    Pit,
-    #[serde(alias = "arm")]
-    Arm,
 }
 
 impl PlayerType {
     fn is_batter(self) -> bool {
-        matches!(self, Self::Batter | Self::Bat | Self::Hitter)
+        matches!(self, Self::Batter)
     }
 }
 
 impl std::fmt::Display for PlayerType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Batter | Self::Bat | Self::Hitter => write!(f, "batter"),
-            Self::Pitcher | Self::Pit | Self::Arm => write!(f, "pitcher"),
+            Self::Batter => write!(f, "batter"),
+            Self::Pitcher => write!(f, "pitcher"),
         }
     }
 }
@@ -227,6 +221,36 @@ pub struct AppState {
     pub db: Arc<Database>,
 }
 
+impl AppState {
+    /// Check the cache for `key`; on miss, run `fetch` and cache the result.
+    ///
+    /// Returns the pretty-printed JSON string of the (possibly cached) value.
+    async fn cached_fetch<F, Fut, T>(
+        &self,
+        key: String,
+        ttl_seconds: i64,
+        fetch: F,
+    ) -> Result<String, ErrorData>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T, ErrorData>>,
+        T: serde::Serialize,
+    {
+        if let Some(cached) = self.db.get_cached_async(key.clone()).await {
+            return serde_json::to_string_pretty(&cached)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None));
+        }
+
+        let data = fetch().await?;
+        let value = serde_json::to_value(&data)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        self.db.set_cached_async(key, value, ttl_seconds).await;
+
+        serde_json::to_string_pretty(&data)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+    }
+}
+
 // ─── MCP server ─────────────────────────────────────────────────────────────
 
 /// MCP server implementation for Fantrax.
@@ -252,26 +276,15 @@ impl FantraxServer {
         description = "List all fantasy baseball leagues for the configured Fantrax user."
     )]
     async fn list_leagues(&self, _params: Parameters<()>) -> Result<String, ErrorData> {
-        let cache_key = "leagues";
-
-        if let Some(cached) = self.state.db.get_cached(cache_key) {
-            return serde_json::to_string_pretty(&cached)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None));
-        }
-
-        let leagues = self
-            .state
-            .client
-            .get_leagues()
+        self.state
+            .cached_fetch("leagues".into(), 900, || async {
+                self.state
+                    .client
+                    .get_leagues()
+                    .await
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            })
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        let value = serde_json::to_value(&leagues)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        self.state.db.set_cached(cache_key, &value, 900); // 15 min TTL
-
-        serde_json::to_string_pretty(&leagues)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
     /// Get current standings for a league.
@@ -283,26 +296,15 @@ impl FantraxServer {
         &self,
         Parameters(args): Parameters<LeagueIdArgs>,
     ) -> Result<String, ErrorData> {
-        let cache_key = format!("standings:{}", args.league_id);
-
-        if let Some(cached) = self.state.db.get_cached(&cache_key) {
-            return serde_json::to_string_pretty(&cached)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None));
-        }
-
-        let standings = self
-            .state
-            .client
-            .get_standings(&args.league_id)
+        self.state
+            .cached_fetch(format!("standings:{}", args.league_id), 900, || async {
+                self.state
+                    .client
+                    .get_standings(&args.league_id)
+                    .await
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            })
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        let value = serde_json::to_value(&standings)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        self.state.db.set_cached(&cache_key, &value, 900); // 15 min TTL
-
-        serde_json::to_string_pretty(&standings)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
     /// Get team rosters for a league and scoring period.
@@ -314,26 +316,19 @@ impl FantraxServer {
         &self,
         Parameters(args): Parameters<RosterArgs>,
     ) -> Result<String, ErrorData> {
-        let cache_key = format!("roster:{}:{}", args.league_id, args.period);
-
-        if let Some(cached) = self.state.db.get_cached(&cache_key) {
-            return serde_json::to_string_pretty(&cached)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None));
-        }
-
-        let rosters = self
-            .state
-            .client
-            .get_team_rosters(&args.league_id, &args.period)
+        self.state
+            .cached_fetch(
+                format!("roster:{}:{}", args.league_id, args.period),
+                900,
+                || async {
+                    self.state
+                        .client
+                        .get_team_rosters(&args.league_id, &args.period)
+                        .await
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+                },
+            )
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        let value = serde_json::to_value(&rosters)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        self.state.db.set_cached(&cache_key, &value, 900); // 15 min TTL
-
-        serde_json::to_string_pretty(&rosters)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
     /// Get league info/metadata.
@@ -345,26 +340,15 @@ impl FantraxServer {
         &self,
         Parameters(args): Parameters<LeagueIdArgs>,
     ) -> Result<String, ErrorData> {
-        let cache_key = format!("league_info:{}", args.league_id);
-
-        if let Some(cached) = self.state.db.get_cached(&cache_key) {
-            return serde_json::to_string_pretty(&cached)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None));
-        }
-
-        let info = self
-            .state
-            .client
-            .get_league_info(&args.league_id)
+        self.state
+            .cached_fetch(format!("league_info:{}", args.league_id), 900, || async {
+                self.state
+                    .client
+                    .get_league_info(&args.league_id)
+                    .await
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+            })
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        let value = serde_json::to_value(&info)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        self.state.db.set_cached(&cache_key, &value, 900); // 15 min TTL
-
-        serde_json::to_string_pretty(&info)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
     /// Get all player IDs for a sport.
@@ -376,31 +360,27 @@ impl FantraxServer {
         &self,
         Parameters(args): Parameters<PlayerIdsArgs>,
     ) -> Result<String, ErrorData> {
-        let cache_key = format!("player_ids:{}", args.sport);
+        self.state
+            .cached_fetch(
+                format!("player_ids:{}", args.sport),
+                604_800, // 7-day TTL
+                || async {
+                    let player_ids = self
+                        .state
+                        .client
+                        .get_player_ids(&args.sport)
+                        .await
+                        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        if let Some(cached) = self.state.db.get_cached(&cache_key) {
-            return serde_json::to_string_pretty(&cached)
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None));
-        }
-
-        let player_ids = self
-            .state
-            .client
-            .get_player_ids(&args.sport)
+                    // Return summary (count) plus the data — full list could be large.
+                    Ok(json!({
+                        "sport": player_ids.sport,
+                        "total_players": player_ids.players.len(),
+                        "players": player_ids.players,
+                    }))
+                },
+            )
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        // Return summary (count) plus the data — full list could be large.
-        let summary = json!({
-            "sport": player_ids.sport,
-            "total_players": player_ids.players.len(),
-            "players": player_ids.players,
-        });
-
-        self.state.db.set_cached(&cache_key, &summary, 604_800); // 7-day TTL
-
-        serde_json::to_string_pretty(&summary)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
     /// Log a recommendation to the ledger.
@@ -413,16 +393,19 @@ impl FantraxServer {
         Parameters(args): Parameters<LogRecommendationArgs>,
     ) -> Result<String, ErrorData> {
         let rec_type = args.recommendation_type.to_string();
+        let players_json = serde_json::to_string(&args.players)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         let id = self
             .state
             .db
-            .log_recommendation(
-                &args.agent_id,
-                &args.league_id,
-                &rec_type,
-                &args.players,
-                &args.reasoning,
+            .log_recommendation_async(
+                args.agent_id,
+                args.league_id,
+                rec_type,
+                players_json,
+                args.reasoning,
             )
+            .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let response = json!({
@@ -445,7 +428,8 @@ impl FantraxServer {
         let recs = self
             .state
             .db
-            .get_recommendations(&args.league_id, args.agent_id.as_deref());
+            .get_recommendations_async(args.league_id, args.agent_id)
+            .await;
         serde_json::to_string_pretty(&recs)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
@@ -462,7 +446,8 @@ impl FantraxServer {
         let outcome_str = args.outcome.to_string();
         self.state
             .db
-            .record_outcome(args.id, &outcome_str)
+            .record_outcome_async(args.id, outcome_str.clone())
+            .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         let response = json!({

@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fantrax
         .user_secret_id
         .take()
-        .expect("user_secret_id missing from config");
+        .ok_or("user_secret_id missing from fantrax config")?;
     let client = FantraxClient::new(secret);
     let db = Arc::new(db);
     let mlb = MlbClient::new(Arc::clone(&db));

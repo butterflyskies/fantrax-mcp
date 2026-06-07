@@ -95,7 +95,7 @@ pub async fn generate_briefing(
     let what_to_do = build_what_to_do(league, team_id, date, mlb, &roster).await?;
 
     // ── Layer 3: Hot takes (stub) ──────────────────────────────────────
-    let hot_takes = build_hot_takes(&league.id, db);
+    let hot_takes = build_hot_takes(&league.id, db).await;
 
     let league_type = league.league_type.to_string();
 
@@ -458,8 +458,8 @@ fn is_bench_or_il_slot(position: &str) -> bool {
 ///
 /// This is a placeholder for editorial commentary that will be LLM-generated
 /// in a future iteration.
-fn build_hot_takes(league_id: &LeagueId, db: &Arc<Database>) -> Vec<String> {
-    let recs = db.get_recommendations(league_id, None);
+async fn build_hot_takes(league_id: &LeagueId, db: &Arc<Database>) -> Vec<String> {
+    let recs = db.get_recommendations_async(league_id.clone(), None).await;
 
     // Only look at the 10 most recent entries.
     let recent: Vec<_> = recs.into_iter().take(10).collect();
