@@ -456,10 +456,10 @@ fn enrich_roster_names(roster: &mut Roster, player_ids: &PlayerIds) {
 
     for team in &mut roster.teams {
         for player in &mut team.players {
-            if player.name == "Unknown" {
-                if let Some(&name) = name_map.get(player.player_id.as_str()) {
-                    player.name = name.to_string();
-                }
+            if player.name == "Unknown"
+                && let Some(&name) = name_map.get(player.player_id.as_str())
+            {
+                player.name = name.to_string();
             }
         }
     }
