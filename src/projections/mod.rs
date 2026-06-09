@@ -674,4 +674,281 @@ mod tests {
         // Unparseable string
         assert!((parse_stat_str(&Value::String("N/A".into()))).abs() < f64::EPSILON);
     }
+
+    // ── Integration: batter projections with sort + stat verification ──
+
+    #[test]
+    fn batter_projections_sorted_by_war_with_key_stats() {
+        let resp: Value = serde_json::from_str(BATTER_FIXTURE).unwrap();
+        let mut batters = parse_batter_response(&resp).unwrap();
+
+        // Sort the same way ProjectionClient does.
+        batters.sort_by(|a, b| {
+            b.war
+                .partial_cmp(&a.war)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        assert!(!batters.is_empty(), "should return non-empty results");
+        assert_eq!(batters.len(), 3);
+
+        // Verify WAR descending order.
+        for pair in batters.windows(2) {
+            assert!(
+                pair[0].war >= pair[1].war,
+                "expected WAR descending: {} >= {}",
+                pair[0].war,
+                pair[1].war
+            );
+        }
+
+        // All players have names.
+        for b in &batters {
+            assert!(!b.player_name.is_empty(), "player_name should be present");
+        }
+
+        // Top player has non-zero key stats.
+        let top = &batters[0];
+        assert!(top.hr > 0.0, "top batter HR should be non-zero");
+        assert!(top.avg > 0.0, "top batter AVG should be non-zero");
+        assert!(top.war > 0.0, "top batter WAR should be non-zero");
+    }
+
+    // ── Integration: pitcher projections with sort + stat verification ──
+
+    #[test]
+    fn pitcher_projections_sorted_by_war_with_key_stats() {
+        let resp: Value = serde_json::from_str(PITCHER_FIXTURE).unwrap();
+        let mut pitchers = parse_pitcher_response(&resp).unwrap();
+
+        // Sort the same way ProjectionClient does.
+        pitchers.sort_by(|a, b| {
+            b.war
+                .partial_cmp(&a.war)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        assert!(!pitchers.is_empty(), "should return non-empty results");
+        assert_eq!(pitchers.len(), 3);
+
+        // Verify WAR descending order.
+        for pair in pitchers.windows(2) {
+            assert!(
+                pair[0].war >= pair[1].war,
+                "expected WAR descending: {} >= {}",
+                pair[0].war,
+                pair[1].war
+            );
+        }
+
+        // All players have names.
+        for p in &pitchers {
+            assert!(!p.player_name.is_empty(), "player_name should be present");
+        }
+
+        // Top pitcher has non-zero key stats.
+        let top = &pitchers[0];
+        assert!(top.era > 0.0, "top pitcher ERA should be non-zero");
+        assert!(top.whip > 0.0, "top pitcher WHIP should be non-zero");
+        assert!(top.war > 0.0, "top pitcher WAR should be non-zero");
+    }
+
+    // ── Integration: name filter ──
+
+    #[test]
+    fn name_filter_returns_matching_players_only() {
+        let resp: Value = serde_json::from_str(BATTER_FIXTURE).unwrap();
+        let batters = parse_batter_response(&resp).unwrap();
+
+        // Apply the same case-insensitive substring filter that server.rs uses.
+        let filter = "ohtani";
+        let filtered: Vec<_> = batters
+            .into_iter()
+            .filter(|p| p.player_name.to_lowercase().contains(filter))
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].player_name, "Shohei Ohtani");
+    }
+
+    #[test]
+    fn name_filter_case_insensitive() {
+        let resp: Value = serde_json::from_str(PITCHER_FIXTURE).unwrap();
+        let pitchers = parse_pitcher_response(&resp).unwrap();
+
+        // Mixed-case filter should still match.
+        let filter = "skubal";
+        let filtered: Vec<_> = pitchers
+            .into_iter()
+            .filter(|p| p.player_name.to_lowercase().contains(filter))
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].player_name, "Tarik Skubal");
+    }
+
+    #[test]
+    fn name_filter_no_match_returns_empty() {
+        let resp: Value = serde_json::from_str(BATTER_FIXTURE).unwrap();
+        let batters = parse_batter_response(&resp).unwrap();
+
+        let filter = "nonexistent_player_xyz";
+        let filtered: Vec<_> = batters
+            .into_iter()
+            .filter(|p| p.player_name.to_lowercase().contains(filter))
+            .collect();
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn name_filter_partial_match() {
+        let resp: Value = serde_json::from_str(BATTER_FIXTURE).unwrap();
+        let batters = parse_batter_response(&resp).unwrap();
+
+        // "witt" should match "Bobby Witt Jr."
+        let filter = "witt";
+        let filtered: Vec<_> = batters
+            .into_iter()
+            .filter(|p| p.player_name.to_lowercase().contains(filter))
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].player_name, "Bobby Witt Jr.");
+    }
+
+    // ── Integration: cache hit on second call ──
+
+    #[tokio::test]
+    async fn cache_hit_returns_cached_batter_data() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = dir.path().join("proj_test.db");
+        let db = Arc::new(crate::db::Database::open(&db_path).expect("failed to open test db"));
+
+        let client = ProjectionClient::new(Arc::clone(&db), "projected_ZipsRos".to_string(), 24);
+
+        // Pre-populate the cache with known batter data.
+        let cached_batters = vec![BatterProjection {
+            player_name: "Test Player".to_string(),
+            team: "TST".to_string(),
+            pa: 500.0,
+            hr: 30.0,
+            rbi: 90.0,
+            sb: 10.0,
+            avg: 0.280,
+            obp: 0.350,
+            slg: 0.500,
+            ops: 0.850,
+            war: 5.0,
+        }];
+
+        let cache_key = "mlb:proj:bat:projected_ZipsRos";
+        let value = serde_json::to_value(&cached_batters).unwrap();
+        db.set_cached(cache_key, &value, 3600);
+
+        // This should return cached data without hitting the network.
+        let result = client.get_batter_projections().await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].player_name, "Test Player");
+        assert_eq!(result[0].team, "TST");
+        assert!((result[0].hr - 30.0).abs() < f64::EPSILON);
+        assert!((result[0].war - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn cache_hit_returns_cached_pitcher_data() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = dir.path().join("proj_test.db");
+        let db = Arc::new(crate::db::Database::open(&db_path).expect("failed to open test db"));
+
+        let client = ProjectionClient::new(Arc::clone(&db), "projected_ZipsRos".to_string(), 24);
+
+        // Pre-populate the cache with known pitcher data.
+        let cached_pitchers = vec![PitcherProjection {
+            player_name: "Test Pitcher".to_string(),
+            team: "TST".to_string(),
+            ip: 180.0,
+            w: 15.0,
+            era: 2.80,
+            whip: 1.05,
+            k: 220.0,
+            sv: 0.0,
+            war: 6.0,
+        }];
+
+        let cache_key = "mlb:proj:pit:projected_ZipsRos";
+        let value = serde_json::to_value(&cached_pitchers).unwrap();
+        db.set_cached(cache_key, &value, 3600);
+
+        // This should return cached data without hitting the network.
+        let result = client.get_pitcher_projections().await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].player_name, "Test Pitcher");
+        assert!((result[0].era - 2.80).abs() < 0.01);
+        assert!((result[0].war - 6.0).abs() < f64::EPSILON);
+    }
+
+    // ── Live API smoke tests (ignored by default — hit the real MLB Stats API) ──
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_batter_projections() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = dir.path().join("live_test.db");
+        let db = Arc::new(crate::db::Database::open(&db_path).expect("failed to open test db"));
+
+        let client = ProjectionClient::new(Arc::clone(&db), "projected_ZipsRos".to_string(), 24);
+
+        let batters = client.get_batter_projections().await.unwrap();
+        assert!(
+            !batters.is_empty(),
+            "live batter projections should return results"
+        );
+
+        // Verify WAR descending.
+        for pair in batters.windows(2) {
+            assert!(
+                pair[0].war >= pair[1].war,
+                "expected WAR descending: {} >= {}",
+                pair[0].war,
+                pair[1].war
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_pitcher_projections() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = dir.path().join("live_test.db");
+        let db = Arc::new(crate::db::Database::open(&db_path).expect("failed to open test db"));
+
+        let client = ProjectionClient::new(Arc::clone(&db), "projected_ZipsRos".to_string(), 24);
+
+        let pitchers = client.get_pitcher_projections().await.unwrap();
+        assert!(
+            !pitchers.is_empty(),
+            "live pitcher projections should return results"
+        );
+
+        // Verify WAR descending.
+        for pair in pitchers.windows(2) {
+            assert!(
+                pair[0].war >= pair[1].war,
+                "expected WAR descending: {} >= {}",
+                pair[0].war,
+                pair[1].war
+            );
+        }
+    }
 }
