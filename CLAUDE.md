@@ -28,8 +28,18 @@ Concrete examples of doc/wire divergence:
 - Roster endpoint returns an object keyed by team ID, not an array (PR #9)
 - Player data lives under `rosterItems`, not `players` or `roster` (PR #9)
 - Roster endpoint does not include player names — only IDs (PR #10)
+- FanGraphs projections endpoint returns 403 Forbidden — scraping blocked (issue #12)
 
 When adding new endpoint support: call the live API first, capture the response, and build your parser and tests against that.
+
+## Smoke/integration tests (MANDATORY)
+
+**Every tool that hits an external API must have a live endpoint smoke test.** This is a coding standard, not a nice-to-have.
+
+- Smoke tests verify: endpoint returns 200, response shape matches parser expectations, key fields are present.
+- Run smoke tests in CI or as a pre-merge check. If the endpoint is down or returns unexpected data, the test fails and the PR doesn't merge.
+- Pre-existing tools without smoke tests need them added retroactively.
+- This rule exists because issue #12 (FanGraphs 403) shipped without any live endpoint test and went undetected until a user tried to use it.
 
 ## Building
 
