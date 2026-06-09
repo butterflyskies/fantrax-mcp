@@ -889,13 +889,12 @@ impl FantraxServer {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
-    /// Get FanGraphs rest-of-season projections for batters or pitchers.
+    /// Get MLB Stats API rest-of-season ZiPS projections for batters or pitchers.
     #[tool(
         name = "get_projections",
-        description = "Get FanGraphs rest-of-season projections (Steamer, ZiPS, ATC, etc.) for \
-                       batters or pitchers. Results are sorted by WAR descending. Optionally \
-                       filter by player name (case-insensitive substring match). Cached for 24 \
-                       hours."
+        description = "Get MLB Stats API rest-of-season ZiPS projections for batters or pitchers. \
+                       Results are sorted by WAR descending. Optionally filter by player name \
+                       (case-insensitive substring match). Cached for 24 hours."
     )]
     async fn get_projections(
         &self,
@@ -964,11 +963,12 @@ impl ServerHandler for FantraxServer {
             "Fantasy baseball MCP server for Fantrax and MLB Stats. Provides league standings, \
              roster data, player IDs, league info, probable starters with handedness, player \
              game lines from box scores, platoon-based lineup optimization, morning briefings, \
-             and FanGraphs rest-of-season projections. Use `list_leagues` to discover Fantrax \
-             leagues, `get_probable_starters` for today's pitching matchups, `get_player_snippet` \
-             for a player's most recent stat line, `optimize_lineup` for start/sit recommendations \
-             based on platoon matchups, `get_briefing` for a comprehensive morning briefing, and \
-             `get_projections` for FanGraphs WAR-sorted projections for batters or pitchers."
+             and MLB Stats API rest-of-season ZiPS projections. Use `list_leagues` to discover \
+             Fantrax leagues, `get_probable_starters` for today's pitching matchups, \
+             `get_player_snippet` for a player's most recent stat line, `optimize_lineup` for \
+             start/sit recommendations based on platoon matchups, `get_briefing` for a \
+             comprehensive morning briefing, and `get_projections` for MLB Stats API WAR-sorted \
+             ZiPS projections for batters or pitchers."
                 .to_string(),
         )
     }

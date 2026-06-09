@@ -6,28 +6,24 @@ use serde_json::Value;
 use tracing::instrument;
 
 use crate::db::Database;
-use crate::util;
 
 // ─── Cache TTLs (seconds) ──────────────────────────────────────────────────
 
 const PROJECTIONS_TTL: i64 = 24 * 3600; // 24 hours
 
-/// FanGraphs projections API base URL.
-const API_BASE: &str = "https://www.fangraphs.com/api/projections";
-
-/// FanGraphs CSV export URL (fallback).
-const CSV_BASE: &str = "https://www.fangraphs.com/projections";
+/// MLB Stats API base URL for projections.
+const API_BASE: &str = "https://statsapi.mlb.com/api/v1/stats";
 
 // ─── Error type ────────────────────────────────────────────────────────────
 
-/// Errors that can occur when fetching FanGraphs projections.
+/// Errors that can occur when fetching MLB Stats API projections.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectionError {
     /// HTTP transport error from reqwest.
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-    /// The API/CSV returned data we couldn't parse.
-    #[error("FanGraphs parse error: {0}")]
+    /// The API returned data we couldn't parse.
+    #[error("MLB Stats API parse error: {0}")]
     Parse(String),
 }
 
@@ -65,11 +61,11 @@ pub struct PitcherProjection {
 
 // ─── Client implementation ─────────────────────────────────────────────────
 
-/// HTTP client for FanGraphs projections with SQLite-backed caching.
+/// HTTP client for MLB Stats API projections with SQLite-backed caching.
 pub struct ProjectionClient {
     http: reqwest::Client,
     db: Arc<Database>,
-    /// Projection system name (e.g. "steamer", "zips", "atc").
+    /// Projection stat type (e.g. "projected_ZipsRos").
     source: String,
     /// Cache TTL in seconds (from config.projections.refresh_hours).
     ttl: i64,
@@ -78,7 +74,6 @@ pub struct ProjectionClient {
 impl ProjectionClient {
     pub fn new(db: Arc<Database>, source: String, refresh_hours: u64) -> Self {
         let http = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:138.0) Gecko/20100101 Firefox/138.0")
             .timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
@@ -87,6 +82,13 @@ impl ProjectionClient {
             (refresh_hours * 3600) as i64
         } else {
             PROJECTIONS_TTL
+        };
+
+        // Default to projected_ZipsRos if empty.
+        let source = if source.is_empty() {
+            "projected_ZipsRos".to_string()
+        } else {
+            source
         };
 
         Self {
@@ -100,7 +102,7 @@ impl ProjectionClient {
     /// Fetch batter projections, returning results sorted by WAR descending.
     #[instrument(skip(self), fields(source = %self.source))]
     pub async fn get_batter_projections(&self) -> Result<Vec<BatterProjection>, ProjectionError> {
-        let cache_key = format!("fg:proj:bat:{}", self.source);
+        let cache_key = format!("mlb:proj:bat:{}", self.source);
 
         if let Some(cached) = self.db.get_cached(&cache_key) {
             tracing::debug!("batter projections cache hit");
@@ -108,13 +110,7 @@ impl ProjectionClient {
                 .map_err(|e| ProjectionError::Parse(format!("cache deserialize error: {e}")));
         }
 
-        let mut projections = match self.fetch_batter_api().await {
-            Ok(p) => p,
-            Err(api_err) => {
-                tracing::warn!(%api_err, "API fetch failed, falling back to CSV");
-                self.fetch_batter_csv().await?
-            }
-        };
+        let mut projections = self.fetch_batter_projections().await?;
 
         // Sort by WAR descending.
         projections.sort_by(|a, b| {
@@ -133,7 +129,7 @@ impl ProjectionClient {
     /// Fetch pitcher projections, returning results sorted by WAR descending.
     #[instrument(skip(self), fields(source = %self.source))]
     pub async fn get_pitcher_projections(&self) -> Result<Vec<PitcherProjection>, ProjectionError> {
-        let cache_key = format!("fg:proj:pit:{}", self.source);
+        let cache_key = format!("mlb:proj:pit:{}", self.source);
 
         if let Some(cached) = self.db.get_cached(&cache_key) {
             tracing::debug!("pitcher projections cache hit");
@@ -141,13 +137,7 @@ impl ProjectionClient {
                 .map_err(|e| ProjectionError::Parse(format!("cache deserialize error: {e}")));
         }
 
-        let mut projections = match self.fetch_pitcher_api().await {
-            Ok(p) => p,
-            Err(api_err) => {
-                tracing::warn!(%api_err, "API fetch failed, falling back to CSV");
-                self.fetch_pitcher_csv().await?
-            }
-        };
+        let mut projections = self.fetch_pitcher_projections().await?;
 
         // Sort by WAR descending.
         projections.sort_by(|a, b| {
@@ -163,18 +153,20 @@ impl ProjectionClient {
         Ok(projections)
     }
 
-    // ─── API fetch (JSON) ──────────────────────────────────────────────────
+    // ─── MLB Stats API fetch ──────────────────────────────────────────────
 
-    async fn fetch_batter_api(&self) -> Result<Vec<BatterProjection>, ProjectionError> {
+    async fn fetch_batter_projections(&self) -> Result<Vec<BatterProjection>, ProjectionError> {
         let resp: Value = self
             .http
             .get(API_BASE)
             .query(&[
-                ("type", self.source.as_str()),
-                ("stats", "bat"),
-                ("pos", "all"),
-                ("team", "0"),
-                ("players", "0"),
+                ("stats", self.source.as_str()),
+                ("group", "hitting"),
+                ("sportIds", "1"),
+                ("season", "2026"),
+                ("sortStat", "war"),
+                ("order", "desc"),
+                ("limit", "500"),
             ])
             .send()
             .await?
@@ -182,20 +174,22 @@ impl ProjectionClient {
             .json()
             .await?;
 
-        tracing::debug!("batter projections fetched from API");
-        parse_batter_json(&resp)
+        tracing::debug!("batter projections fetched from MLB Stats API");
+        parse_batter_response(&resp)
     }
 
-    async fn fetch_pitcher_api(&self) -> Result<Vec<PitcherProjection>, ProjectionError> {
+    async fn fetch_pitcher_projections(&self) -> Result<Vec<PitcherProjection>, ProjectionError> {
         let resp: Value = self
             .http
             .get(API_BASE)
             .query(&[
-                ("type", self.source.as_str()),
-                ("stats", "pit"),
-                ("pos", "all"),
-                ("team", "0"),
-                ("players", "0"),
+                ("stats", self.source.as_str()),
+                ("group", "pitching"),
+                ("sportIds", "1"),
+                ("season", "2026"),
+                ("sortStat", "war"),
+                ("order", "desc"),
+                ("limit", "500"),
             ])
             .send()
             .await?
@@ -203,82 +197,81 @@ impl ProjectionClient {
             .json()
             .await?;
 
-        tracing::debug!("pitcher projections fetched from API");
-        parse_pitcher_json(&resp)
-    }
-
-    // ─── CSV fetch (fallback) ──────────────────────────────────────────────
-
-    async fn fetch_batter_csv(&self) -> Result<Vec<BatterProjection>, ProjectionError> {
-        let url = format!(
-            "{CSV_BASE}?pos=all&stats=bat&type={}&team=0&lg=all&players=0",
-            self.source
-        );
-        let text = self
-            .http
-            .get(&url)
-            .header("Accept", "text/csv, text/plain, */*")
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-
-        tracing::debug!(bytes = text.len(), "batter CSV fetched");
-        parse_batter_csv(&text)
-    }
-
-    async fn fetch_pitcher_csv(&self) -> Result<Vec<PitcherProjection>, ProjectionError> {
-        let url = format!(
-            "{CSV_BASE}?pos=all&stats=pit&type={}&team=0&lg=all&players=0",
-            self.source
-        );
-        let text = self
-            .http
-            .get(&url)
-            .header("Accept", "text/csv, text/plain, */*")
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
-
-        tracing::debug!(bytes = text.len(), "pitcher CSV fetched");
-        parse_pitcher_csv(&text)
+        tracing::debug!("pitcher projections fetched from MLB Stats API");
+        parse_pitcher_response(&resp)
     }
 }
 
-// ─── JSON parsing ──────────────────────────────────────────────────────────
+// ─── MLB Stats API response parsing ───────────────────────────────────────
 
-/// Parse batter projections from FanGraphs JSON API response.
+/// Extract the `splits` array from the MLB Stats API response envelope.
 ///
-/// The API returns an array of player objects with varying field names.
-fn parse_batter_json(resp: &Value) -> Result<Vec<BatterProjection>, ProjectionError> {
-    let arr = resp.as_array().ok_or_else(|| {
-        ProjectionError::Parse(format!(
-            "expected JSON array, got: {}",
-            resp.to_string().chars().take(200).collect::<String>()
-        ))
-    })?;
+/// The response shape is: `{ "stats": [ { "splits": [ ... ] } ] }`.
+fn extract_splits(resp: &Value) -> Result<&Vec<Value>, ProjectionError> {
+    resp.get("stats")
+        .and_then(|s| s.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|group| group.get("splits"))
+        .and_then(|s| s.as_array())
+        .ok_or_else(|| {
+            ProjectionError::Parse(format!(
+                "unexpected MLB API response structure: {}",
+                resp.to_string().chars().take(300).collect::<String>()
+            ))
+        })
+}
 
-    let projections = arr
+/// Parse a string-encoded stat value to f64. Returns 0.0 on failure.
+fn parse_stat_str(val: &Value) -> f64 {
+    if let Some(n) = val.as_f64() {
+        return n;
+    }
+    if let Some(n) = val.as_i64() {
+        return n as f64;
+    }
+    if let Some(s) = val.as_str() {
+        return s.parse::<f64>().unwrap_or(0.0);
+    }
+    0.0
+}
+
+/// Parse batter projections from the MLB Stats API response.
+fn parse_batter_response(resp: &Value) -> Result<Vec<BatterProjection>, ProjectionError> {
+    let splits = extract_splits(resp)?;
+
+    let projections = splits
         .iter()
-        .filter_map(|entry| {
-            let player_name = util::json_str(entry, &["PlayerName", "Name", "playerName", "name"])?;
-            let team = util::json_str(entry, &["Team", "team", "TeamName"]).unwrap_or_default();
+        .filter_map(|split| {
+            let player_name = split
+                .get("player")
+                .and_then(|p| p.get("fullName"))
+                .and_then(|n| n.as_str())?
+                .to_string();
+
+            let team = split
+                .get("team")
+                .and_then(|t| {
+                    t.get("abbreviation")
+                        .or_else(|| t.get("name"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("")
+                .to_string();
+
+            let stat = split.get("stat")?;
 
             Some(BatterProjection {
                 player_name,
                 team,
-                pa: util::json_f64(entry, &["PA", "pa", "PlateAppearances"]),
-                hr: util::json_f64(entry, &["HR", "hr", "HomeRuns"]),
-                rbi: util::json_f64(entry, &["RBI", "rbi"]),
-                sb: util::json_f64(entry, &["SB", "sb", "StolenBases"]),
-                avg: util::json_f64(entry, &["AVG", "avg", "BA"]),
-                obp: util::json_f64(entry, &["OBP", "obp"]),
-                slg: util::json_f64(entry, &["SLG", "slg"]),
-                ops: util::json_f64(entry, &["OPS", "ops"]),
-                war: util::json_f64(entry, &["WAR", "war"]),
+                pa: parse_stat_str(stat.get("plateAppearances").unwrap_or(&Value::Null)),
+                hr: parse_stat_str(stat.get("homeRuns").unwrap_or(&Value::Null)),
+                rbi: parse_stat_str(stat.get("rbi").unwrap_or(&Value::Null)),
+                sb: parse_stat_str(stat.get("stolenBases").unwrap_or(&Value::Null)),
+                avg: parse_stat_str(stat.get("avg").unwrap_or(&Value::Null)),
+                obp: parse_stat_str(stat.get("obp").unwrap_or(&Value::Null)),
+                slg: parse_stat_str(stat.get("slg").unwrap_or(&Value::Null)),
+                ops: parse_stat_str(stat.get("ops").unwrap_or(&Value::Null)),
+                war: parse_stat_str(stat.get("war").unwrap_or(&Value::Null)),
             })
         })
         .collect();
@@ -286,31 +279,41 @@ fn parse_batter_json(resp: &Value) -> Result<Vec<BatterProjection>, ProjectionEr
     Ok(projections)
 }
 
-/// Parse pitcher projections from FanGraphs JSON API response.
-fn parse_pitcher_json(resp: &Value) -> Result<Vec<PitcherProjection>, ProjectionError> {
-    let arr = resp.as_array().ok_or_else(|| {
-        ProjectionError::Parse(format!(
-            "expected JSON array, got: {}",
-            resp.to_string().chars().take(200).collect::<String>()
-        ))
-    })?;
+/// Parse pitcher projections from the MLB Stats API response.
+fn parse_pitcher_response(resp: &Value) -> Result<Vec<PitcherProjection>, ProjectionError> {
+    let splits = extract_splits(resp)?;
 
-    let projections = arr
+    let projections = splits
         .iter()
-        .filter_map(|entry| {
-            let player_name = util::json_str(entry, &["PlayerName", "Name", "playerName", "name"])?;
-            let team = util::json_str(entry, &["Team", "team", "TeamName"]).unwrap_or_default();
+        .filter_map(|split| {
+            let player_name = split
+                .get("player")
+                .and_then(|p| p.get("fullName"))
+                .and_then(|n| n.as_str())?
+                .to_string();
+
+            let team = split
+                .get("team")
+                .and_then(|t| {
+                    t.get("abbreviation")
+                        .or_else(|| t.get("name"))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("")
+                .to_string();
+
+            let stat = split.get("stat")?;
 
             Some(PitcherProjection {
                 player_name,
                 team,
-                ip: util::json_f64(entry, &["IP", "ip", "InningsPitched"]),
-                w: util::json_f64(entry, &["W", "w", "Wins"]),
-                era: util::json_f64(entry, &["ERA", "era"]),
-                whip: util::json_f64(entry, &["WHIP", "whip"]),
-                k: util::json_f64(entry, &["SO", "K", "k", "so", "Strikeouts"]),
-                sv: util::json_f64(entry, &["SV", "sv", "Saves"]),
-                war: util::json_f64(entry, &["WAR", "war"]),
+                ip: parse_stat_str(stat.get("inningsPitched").unwrap_or(&Value::Null)),
+                w: parse_stat_str(stat.get("wins").unwrap_or(&Value::Null)),
+                era: parse_stat_str(stat.get("era").unwrap_or(&Value::Null)),
+                whip: parse_stat_str(stat.get("whip").unwrap_or(&Value::Null)),
+                k: parse_stat_str(stat.get("strikeOuts").unwrap_or(&Value::Null)),
+                sv: parse_stat_str(stat.get("saves").unwrap_or(&Value::Null)),
+                war: parse_stat_str(stat.get("war").unwrap_or(&Value::Null)),
             })
         })
         .collect();
@@ -318,155 +321,343 @@ fn parse_pitcher_json(resp: &Value) -> Result<Vec<PitcherProjection>, Projection
     Ok(projections)
 }
 
-// ─── CSV parsing ───────────────────────────────────────────────────────────
+// ─── Tests ────────────────────────────────────────────────────────────────
 
-/// Parse batter projections from FanGraphs CSV export.
-fn parse_batter_csv(text: &str) -> Result<Vec<BatterProjection>, ProjectionError> {
-    let mut lines = text.lines();
-    let header_line = lines
-        .next()
-        .ok_or_else(|| ProjectionError::Parse("empty CSV".into()))?;
-    let headers: Vec<&str> = header_line.split(',').map(str::trim).collect();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let col = |name: &str| -> Option<usize> {
-        headers.iter().position(|h| {
-            h.eq_ignore_ascii_case(name) || h.trim_matches('"').eq_ignore_ascii_case(name)
-        })
-    };
+    /// Captured real MLB Stats API response for hitting projections (3 players).
+    const BATTER_FIXTURE: &str = r#"{
+        "copyright": "Copyright 2026 MLB Advanced Media, L.P.",
+        "stats": [{
+            "type": { "displayName": "projected_ZipsRos" },
+            "group": { "displayName": "hitting" },
+            "totalSplits": 544,
+            "exemptions": [],
+            "splits": [
+                {
+                    "season": "2026",
+                    "stat": {
+                        "gamesPlayed": 87,
+                        "runs": 65,
+                        "doubles": 16,
+                        "triples": 0,
+                        "homeRuns": 26,
+                        "strikeOuts": 98,
+                        "baseOnBalls": 67,
+                        "intentionalWalks": 12,
+                        "hits": 86,
+                        "hitByPitch": 4,
+                        "avg": ".278",
+                        "atBats": 309,
+                        "obp": ".411",
+                        "slg": ".583",
+                        "ops": ".994",
+                        "caughtStealing": 2,
+                        "stolenBases": 5,
+                        "stolenBasePercentage": ".714",
+                        "plateAppearances": 381,
+                        "totalBases": 180,
+                        "rbi": 69,
+                        "sacBunts": 0,
+                        "sacFlies": 2,
+                        "babip": ".321",
+                        "war": 4.49635372009521
+                    },
+                    "player": {
+                        "id": 592450,
+                        "fullName": "Aaron Judge",
+                        "link": "/api/v1/people/592450",
+                        "firstName": "Aaron",
+                        "lastName": "Judge"
+                    },
+                    "sport": { "id": 1, "link": "/api/v1/sports/1" },
+                    "rank": 1,
+                    "position": { "code": "9", "name": "Outfielder", "abbreviation": "RF" }
+                },
+                {
+                    "season": "2026",
+                    "stat": {
+                        "gamesPlayed": 91,
+                        "runs": 56,
+                        "doubles": 23,
+                        "triples": 4,
+                        "homeRuns": 15,
+                        "strikeOuts": 70,
+                        "baseOnBalls": 32,
+                        "hits": 103,
+                        "avg": ".288",
+                        "atBats": 358,
+                        "obp": ".349",
+                        "slg": ".500",
+                        "ops": ".849",
+                        "stolenBases": 22,
+                        "plateAppearances": 396,
+                        "totalBases": 179,
+                        "rbi": 52,
+                        "war": 4.26370278208768
+                    },
+                    "player": {
+                        "id": 677951,
+                        "fullName": "Bobby Witt Jr.",
+                        "link": "/api/v1/people/677951",
+                        "firstName": "Bobby",
+                        "lastName": "Witt"
+                    },
+                    "sport": { "id": 1, "link": "/api/v1/sports/1" },
+                    "rank": 2,
+                    "position": { "code": "6", "name": "Shortstop", "abbreviation": "SS" }
+                },
+                {
+                    "season": "2026",
+                    "stat": {
+                        "gamesPlayed": 91,
+                        "runs": 76,
+                        "doubles": 18,
+                        "triples": 3,
+                        "homeRuns": 26,
+                        "strikeOuts": 98,
+                        "baseOnBalls": 57,
+                        "hits": 100,
+                        "avg": ".288",
+                        "atBats": 347,
+                        "obp": ".392",
+                        "slg": ".582",
+                        "ops": ".974",
+                        "stolenBases": 15,
+                        "plateAppearances": 411,
+                        "totalBases": 202,
+                        "rbi": 72,
+                        "war": 3.75397483830303
+                    },
+                    "player": {
+                        "id": 660271,
+                        "fullName": "Shohei Ohtani",
+                        "link": "/api/v1/people/660271",
+                        "firstName": "Shohei",
+                        "lastName": "Ohtani"
+                    },
+                    "sport": { "id": 1, "link": "/api/v1/sports/1" },
+                    "rank": 3,
+                    "position": { "code": "Y", "name": "Two-Way Player", "abbreviation": "TWP" }
+                }
+            ],
+            "splitsTiedWithOffset": [],
+            "splitsTiedWithLimit": [],
+            "playerPool": "ALL"
+        }]
+    }"#;
 
-    let name_col = col("Name")
-        .or_else(|| col("PlayerName"))
-        .ok_or_else(|| ProjectionError::Parse("no Name column in CSV".into()))?;
-    let team_col = col("Team");
-    let pa_col = col("PA");
-    let hr_col = col("HR");
-    let rbi_col = col("RBI");
-    let sb_col = col("SB");
-    let avg_col = col("AVG");
-    let obp_col = col("OBP");
-    let slg_col = col("SLG");
-    let ops_col = col("OPS");
-    let war_col = col("WAR");
+    /// Captured real MLB Stats API response for pitching projections (3 players).
+    const PITCHER_FIXTURE: &str = r#"{
+        "copyright": "Copyright 2026 MLB Advanced Media, L.P.",
+        "stats": [{
+            "type": { "displayName": "projected_ZipsRos" },
+            "group": { "displayName": "pitching" },
+            "totalSplits": 641,
+            "exemptions": [],
+            "splits": [
+                {
+                    "season": "2026",
+                    "stat": {
+                        "gamesPlayed": 16,
+                        "gamesStarted": 16,
+                        "runs": 30,
+                        "homeRuns": 8,
+                        "strikeOuts": 119,
+                        "baseOnBalls": 17,
+                        "hits": 77,
+                        "era": "2.56",
+                        "inningsPitched": "98.1",
+                        "wins": 7,
+                        "losses": 2,
+                        "saves": 0,
+                        "earnedRuns": 28,
+                        "whip": "0.96",
+                        "battersFaced": 387,
+                        "war": 3.41971693984317
+                    },
+                    "player": {
+                        "id": 669373,
+                        "fullName": "Tarik Skubal",
+                        "link": "/api/v1/people/669373",
+                        "firstName": "Tarik",
+                        "lastName": "Skubal"
+                    },
+                    "sport": { "id": 1, "link": "/api/v1/sports/1" },
+                    "rank": 1,
+                    "position": { "code": "1", "name": "Pitcher", "abbreviation": "P" }
+                },
+                {
+                    "season": "2026",
+                    "stat": {
+                        "gamesPlayed": 18,
+                        "gamesStarted": 18,
+                        "runs": 40,
+                        "homeRuns": 8,
+                        "strikeOuts": 116,
+                        "baseOnBalls": 25,
+                        "hits": 99,
+                        "era": "2.96",
+                        "inningsPitched": "112.1",
+                        "wins": 7,
+                        "losses": 3,
+                        "saves": 0,
+                        "earnedRuns": 37,
+                        "whip": "1.10",
+                        "battersFaced": 458,
+                        "war": 3.22891314211437
+                    },
+                    "player": {
+                        "id": 650911,
+                        "fullName": "Cristopher Sánchez",
+                        "link": "/api/v1/people/650911",
+                        "firstName": "Cristopher",
+                        "lastName": "Sánchez"
+                    },
+                    "sport": { "id": 1, "link": "/api/v1/sports/1" },
+                    "rank": 2,
+                    "position": { "code": "1", "name": "Pitcher", "abbreviation": "P" }
+                },
+                {
+                    "season": "2026",
+                    "stat": {
+                        "gamesPlayed": 19,
+                        "gamesStarted": 19,
+                        "runs": 35,
+                        "homeRuns": 9,
+                        "strikeOuts": 121,
+                        "baseOnBalls": 26,
+                        "hits": 84,
+                        "era": "2.83",
+                        "inningsPitched": "105.0",
+                        "wins": 8,
+                        "losses": 4,
+                        "saves": 0,
+                        "earnedRuns": 33,
+                        "whip": "1.05",
+                        "battersFaced": 422,
+                        "war": 3.00923241215303
+                    },
+                    "player": {
+                        "id": 694973,
+                        "fullName": "Paul Skenes",
+                        "link": "/api/v1/people/694973",
+                        "firstName": "Paul",
+                        "lastName": "Skenes"
+                    },
+                    "sport": { "id": 1, "link": "/api/v1/sports/1" },
+                    "rank": 3,
+                    "position": { "code": "1", "name": "Pitcher", "abbreviation": "P" }
+                }
+            ],
+            "splitsTiedWithOffset": [],
+            "splitsTiedWithLimit": [],
+            "playerPool": "ALL"
+        }]
+    }"#;
 
-    let mut projections = Vec::new();
-    for line in lines {
-        let fields = parse_csv_line(line);
-        if fields.len() <= name_col {
-            continue;
-        }
+    #[test]
+    fn parse_batter_projections_from_mlb_api() {
+        let resp: Value = serde_json::from_str(BATTER_FIXTURE).unwrap();
+        let batters = parse_batter_response(&resp).unwrap();
 
-        let player_name = fields[name_col].trim_matches('"').to_string();
-        if player_name.is_empty() {
-            continue;
-        }
-        let team = team_col
-            .and_then(|c| fields.get(c))
-            .map(|s| s.trim_matches('"').to_string())
-            .unwrap_or_default();
+        assert_eq!(batters.len(), 3);
 
-        projections.push(BatterProjection {
-            player_name,
-            team,
-            pa: util::csv_f64(&fields, pa_col),
-            hr: util::csv_f64(&fields, hr_col),
-            rbi: util::csv_f64(&fields, rbi_col),
-            sb: util::csv_f64(&fields, sb_col),
-            avg: util::csv_f64(&fields, avg_col),
-            obp: util::csv_f64(&fields, obp_col),
-            slg: util::csv_f64(&fields, slg_col),
-            ops: util::csv_f64(&fields, ops_col),
-            war: util::csv_f64(&fields, war_col),
-        });
+        // Aaron Judge
+        let judge = &batters[0];
+        assert_eq!(judge.player_name, "Aaron Judge");
+        assert_eq!(judge.team, ""); // MLB API doesn't include team in projections
+        assert!((judge.pa - 381.0).abs() < f64::EPSILON);
+        assert!((judge.hr - 26.0).abs() < f64::EPSILON);
+        assert!((judge.rbi - 69.0).abs() < f64::EPSILON);
+        assert!((judge.sb - 5.0).abs() < f64::EPSILON);
+        assert!((judge.avg - 0.278).abs() < 0.001);
+        assert!((judge.obp - 0.411).abs() < 0.001);
+        assert!((judge.slg - 0.583).abs() < 0.001);
+        assert!((judge.ops - 0.994).abs() < 0.001);
+        assert!((judge.war - 4.496).abs() < 0.01);
+
+        // Bobby Witt Jr.
+        let witt = &batters[1];
+        assert_eq!(witt.player_name, "Bobby Witt Jr.");
+        assert!((witt.pa - 396.0).abs() < f64::EPSILON);
+        assert!((witt.sb - 22.0).abs() < f64::EPSILON);
+        assert!((witt.avg - 0.288).abs() < 0.001);
+
+        // Shohei Ohtani
+        let ohtani = &batters[2];
+        assert_eq!(ohtani.player_name, "Shohei Ohtani");
+        assert!((ohtani.hr - 26.0).abs() < f64::EPSILON);
+        assert!((ohtani.ops - 0.974).abs() < 0.001);
     }
 
-    if projections.is_empty() {
-        return Err(ProjectionError::Parse(
-            "no batter projections parsed from CSV".into(),
-        ));
+    #[test]
+    fn parse_pitcher_projections_from_mlb_api() {
+        let resp: Value = serde_json::from_str(PITCHER_FIXTURE).unwrap();
+        let pitchers = parse_pitcher_response(&resp).unwrap();
+
+        assert_eq!(pitchers.len(), 3);
+
+        // Tarik Skubal
+        let skubal = &pitchers[0];
+        assert_eq!(skubal.player_name, "Tarik Skubal");
+        assert_eq!(skubal.team, "");
+        assert!((skubal.ip - 98.1).abs() < 0.1);
+        assert!((skubal.w - 7.0).abs() < f64::EPSILON);
+        assert!((skubal.era - 2.56).abs() < 0.01);
+        assert!((skubal.whip - 0.96).abs() < 0.01);
+        assert!((skubal.k - 119.0).abs() < f64::EPSILON);
+        assert!((skubal.sv - 0.0).abs() < f64::EPSILON);
+        assert!((skubal.war - 3.42).abs() < 0.01);
+
+        // Cristopher Sanchez
+        let sanchez = &pitchers[1];
+        assert_eq!(sanchez.player_name, "Cristopher S\u{00e1}nchez");
+        assert!((sanchez.ip - 112.1).abs() < 0.1);
+        assert!((sanchez.era - 2.96).abs() < 0.01);
+        assert!((sanchez.whip - 1.10).abs() < 0.01);
+
+        // Paul Skenes
+        let skenes = &pitchers[2];
+        assert_eq!(skenes.player_name, "Paul Skenes");
+        assert!((skenes.w - 8.0).abs() < f64::EPSILON);
+        assert!((skenes.k - 121.0).abs() < f64::EPSILON);
+        assert!((skenes.war - 3.009).abs() < 0.01);
     }
 
-    Ok(projections)
-}
+    #[test]
+    fn parse_empty_splits_returns_empty_vec() {
+        let resp: Value =
+            serde_json::from_str(r#"{"stats": [{"splits": [], "type": {}, "group": {}}]}"#)
+                .unwrap();
 
-/// Parse pitcher projections from FanGraphs CSV export.
-fn parse_pitcher_csv(text: &str) -> Result<Vec<PitcherProjection>, ProjectionError> {
-    let mut lines = text.lines();
-    let header_line = lines
-        .next()
-        .ok_or_else(|| ProjectionError::Parse("empty CSV".into()))?;
-    let headers: Vec<&str> = header_line.split(',').map(str::trim).collect();
+        let batters = parse_batter_response(&resp).unwrap();
+        assert!(batters.is_empty());
 
-    let col = |name: &str| -> Option<usize> {
-        headers.iter().position(|h| {
-            h.eq_ignore_ascii_case(name) || h.trim_matches('"').eq_ignore_ascii_case(name)
-        })
-    };
-
-    let name_col = col("Name")
-        .or_else(|| col("PlayerName"))
-        .ok_or_else(|| ProjectionError::Parse("no Name column in CSV".into()))?;
-    let team_col = col("Team");
-    let ip_col = col("IP");
-    let w_col = col("W");
-    let era_col = col("ERA");
-    let whip_col = col("WHIP");
-    let k_col = col("SO").or_else(|| col("K"));
-    let sv_col = col("SV");
-    let war_col = col("WAR");
-
-    let mut projections = Vec::new();
-    for line in lines {
-        let fields = parse_csv_line(line);
-        if fields.len() <= name_col {
-            continue;
-        }
-
-        let player_name = fields[name_col].trim_matches('"').to_string();
-        if player_name.is_empty() {
-            continue;
-        }
-        let team = team_col
-            .and_then(|c| fields.get(c))
-            .map(|s| s.trim_matches('"').to_string())
-            .unwrap_or_default();
-
-        projections.push(PitcherProjection {
-            player_name,
-            team,
-            ip: util::csv_f64(&fields, ip_col),
-            w: util::csv_f64(&fields, w_col),
-            era: util::csv_f64(&fields, era_col),
-            whip: util::csv_f64(&fields, whip_col),
-            k: util::csv_f64(&fields, k_col),
-            sv: util::csv_f64(&fields, sv_col),
-            war: util::csv_f64(&fields, war_col),
-        });
+        let pitchers = parse_pitcher_response(&resp).unwrap();
+        assert!(pitchers.is_empty());
     }
 
-    if projections.is_empty() {
-        return Err(ProjectionError::Parse(
-            "no pitcher projections parsed from CSV".into(),
-        ));
+    #[test]
+    fn parse_malformed_response_returns_error() {
+        let resp: Value = serde_json::from_str(r#"{"unexpected": true}"#).unwrap();
+        assert!(parse_batter_response(&resp).is_err());
+        assert!(parse_pitcher_response(&resp).is_err());
     }
 
-    Ok(projections)
-}
-
-/// Simple CSV line parser that handles quoted fields with commas.
-fn parse_csv_line(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-
-    for ch in line.chars() {
-        match ch {
-            '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
-                fields.push(std::mem::take(&mut current));
-            }
-            _ => current.push(ch),
-        }
+    #[test]
+    fn parse_stat_str_handles_all_types() {
+        // String-encoded float
+        assert!((parse_stat_str(&Value::String(".278".into())) - 0.278).abs() < 0.001);
+        // Integer
+        assert!((parse_stat_str(&serde_json::json!(26)) - 26.0).abs() < f64::EPSILON);
+        // Float
+        assert!((parse_stat_str(&serde_json::json!(4.5)) - 4.5).abs() < f64::EPSILON);
+        // Null
+        assert!((parse_stat_str(&Value::Null)).abs() < f64::EPSILON);
+        // Unparseable string
+        assert!((parse_stat_str(&Value::String("N/A".into()))).abs() < f64::EPSILON);
     }
-    fields.push(current);
-    fields
 }
