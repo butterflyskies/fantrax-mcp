@@ -84,8 +84,22 @@ impl ProjectionClient {
             PROJECTIONS_TTL
         };
 
-        // Default to projected_ZipsRos if empty.
-        let source = if source.is_empty() {
+        const VALID_SOURCES: &[&str] = &[
+            "projected",
+            "projectedRos",
+            "projected_Zips",
+            "projected_ZipsRos",
+            "projected_Zips2YR",
+            "projected_Zips3YR",
+        ];
+
+        let source = if source.is_empty() || !VALID_SOURCES.contains(&source.as_str()) {
+            if !source.is_empty() {
+                tracing::warn!(
+                    old_source = %source,
+                    "unrecognized projection source (FanGraphs values are no longer valid), defaulting to projected_ZipsRos"
+                );
+            }
             "projected_ZipsRos".to_string()
         } else {
             source

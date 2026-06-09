@@ -51,12 +51,15 @@ keeper = false
 # keeper = false
 
 [projections]
-# Projection system to use from FanGraphs.
-# Options: steamer, zips, atc, thebat, thebatx
-source = "steamer"
+# Projection stat type from the MLB Stats API.
+# Options: projected, projectedRos, projected_Zips, projected_ZipsRos,
+#          projected_Zips2YR, projected_Zips3YR
+# NOTE: FanGraphs values (steamer, zips, atc, thebat, thebatx) are no
+# longer valid. If you have an old config, the server will log a warning
+# and default to projected_ZipsRos.
+source = "projected_ZipsRos"
 
 # How often to refresh cached projections, in hours.
-# FanGraphs updates projections roughly once per day.
 refresh_hours = 24
 
 [server]
