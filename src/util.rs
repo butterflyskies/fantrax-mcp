@@ -1,20 +1,6 @@
-//! Shared JSON extraction helpers used across the Fantrax, MLB, and projections
-//! modules.
+//! Shared JSON extraction helpers used across the Fantrax and MLB modules.
 
 use serde_json::Value;
-
-/// Try multiple field names to extract a `String` from a JSON object.
-///
-/// Returns the first matching key's value as a `String`, or `None` if no key
-/// matches or the value isn't a string.
-pub fn json_str(obj: &Value, keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Some(v) = obj.get(*key).and_then(|v| v.as_str()) {
-            return Some(v.to_string());
-        }
-    }
-    None
-}
 
 /// Try multiple field names to extract an `f64` from a JSON object.
 ///
@@ -60,14 +46,4 @@ pub fn json_u32(obj: &Value, keys: &[&str]) -> Option<u32> {
         }
     }
     None
-}
-
-/// Extract an `f64` from CSV fields at the given column index.
-///
-/// Returns `0.0` if the column index is `None`, out of bounds, or the value
-/// can't be parsed.
-pub fn csv_f64(fields: &[String], col: Option<usize>) -> f64 {
-    col.and_then(|c| fields.get(c))
-        .and_then(|s| s.trim().trim_matches('"').parse::<f64>().ok())
-        .unwrap_or(0.0)
 }
