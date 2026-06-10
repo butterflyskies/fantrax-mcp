@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
+use chrono_tz::Tz;
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -22,13 +23,27 @@ use crate::{
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-/// Parse a YYYY-MM-DD date string, or default to today (UTC).
-fn parse_date_or_today(date: Option<&str>) -> Result<NaiveDate, ErrorData> {
+/// The calendar date at instant `now` in timezone `tz`.
+///
+/// MLB schedule dates are US-Eastern-anchored, so "today" must be computed
+/// in a configured zone rather than UTC — UTC rolls past midnight at
+/// 8pm Eastern / 5pm Pacific, mid-slate.
+fn today_in_tz(now: DateTime<Utc>, tz: Tz) -> NaiveDate {
+    now.with_timezone(&tz).date_naive()
+}
+
+/// The calendar date one day before instant `now` in timezone `tz`.
+fn yesterday_in_tz(now: DateTime<Utc>, tz: Tz) -> NaiveDate {
+    today_in_tz(now, tz) - chrono::Duration::days(1)
+}
+
+/// Parse a YYYY-MM-DD date string, or default to today in timezone `tz`.
+fn parse_date_or_today(date: Option<&str>, tz: Tz) -> Result<NaiveDate, ErrorData> {
     match date {
         Some(d) => NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|e| {
             ErrorData::invalid_params(format!("invalid date format (use YYYY-MM-DD): {e}"), None)
         }),
-        None => Ok(chrono::Utc::now().date_naive()),
+        None => Ok(today_in_tz(Utc::now(), tz)),
     }
 }
 
@@ -486,7 +501,7 @@ impl FantraxServer {
         &self,
         Parameters(args): Parameters<ProbableStartersArgs>,
     ) -> Result<String, ErrorData> {
-        let date = parse_date_or_today(args.date.as_deref())?;
+        let date = parse_date_or_today(args.date.as_deref(), self.state.config.server.timezone)?;
 
         let games = self
             .state
@@ -565,8 +580,8 @@ impl FantraxServer {
         Parameters(args): Parameters<PlayerSnippetArgs>,
     ) -> Result<String, ErrorData> {
         let date = match &args.date {
-            Some(d) => parse_date_or_today(Some(d))?,
-            None => chrono::Utc::now().date_naive() - chrono::Duration::days(1),
+            Some(d) => parse_date_or_today(Some(d), self.state.config.server.timezone)?,
+            None => yesterday_in_tz(Utc::now(), self.state.config.server.timezone),
         };
 
         // First get the schedule for that date to find which game the player was in.
@@ -703,7 +718,7 @@ impl FantraxServer {
         &self,
         Parameters(args): Parameters<OptimizeLineupArgs>,
     ) -> Result<String, ErrorData> {
-        let date = parse_date_or_today(args.date.as_deref())?;
+        let date = parse_date_or_today(args.date.as_deref(), self.state.config.server.timezone)?;
 
         // 1. Fetch the roster from Fantrax (enriched with player names).
         let roster = self
@@ -815,7 +830,7 @@ impl FantraxServer {
         &self,
         Parameters(args): Parameters<BriefingArgs>,
     ) -> Result<String, ErrorData> {
-        let date = parse_date_or_today(args.date.as_deref())?;
+        let date = parse_date_or_today(args.date.as_deref(), self.state.config.server.timezone)?;
 
         // Determine which leagues to brief.
         let leagues: Vec<_> = match &args.league_id {
@@ -1005,5 +1020,68 @@ mod tests {
         assert_object_schema::<OptimizeLineupArgs>("OptimizeLineupArgs");
         assert_object_schema::<BriefingArgs>("BriefingArgs");
         assert_object_schema::<GetProjectionsArgs>("GetProjectionsArgs");
+    }
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        s.parse().expect("valid RFC 3339 instant")
+    }
+
+    fn date(s: &str) -> NaiveDate {
+        s.parse().expect("valid date")
+    }
+
+    /// The 5pm-Pacific boundary case: just past UTC midnight, Eastern is
+    /// still the previous evening. UTC would (wrongly) say it's already
+    /// the next day.
+    #[test]
+    fn today_after_utc_midnight_is_still_previous_day_eastern() {
+        let now = utc("2026-06-11T00:30:00Z");
+        assert_eq!(
+            today_in_tz(now, chrono_tz::America::New_York),
+            date("2026-06-10")
+        );
+        // Demonstrate the bug this replaces: naive UTC reads a day ahead.
+        assert_eq!(now.date_naive(), date("2026-06-11"));
+    }
+
+    #[test]
+    fn today_matches_utc_when_no_rollover_in_progress() {
+        // Midday Eastern: both zones agree on the date.
+        let now = utc("2026-06-10T16:00:00Z");
+        assert_eq!(
+            today_in_tz(now, chrono_tz::America::New_York),
+            date("2026-06-10")
+        );
+        assert_eq!(now.date_naive(), date("2026-06-10"));
+    }
+
+    #[test]
+    fn yesterday_after_utc_midnight_is_two_utc_days_back() {
+        // At 2026-06-11T00:30Z, Eastern "today" is 06-10, so "yesterday"
+        // (the slate whose box scores are final) is 06-09. Naive UTC would
+        // have said 06-10 — a slate still in progress.
+        let now = utc("2026-06-11T00:30:00Z");
+        assert_eq!(
+            yesterday_in_tz(now, chrono_tz::America::New_York),
+            date("2026-06-09")
+        );
+        assert_eq!(
+            now.date_naive() - chrono::Duration::days(1),
+            date("2026-06-10")
+        );
+    }
+
+    #[test]
+    fn parse_date_or_today_prefers_explicit_date_over_tz() {
+        let parsed = parse_date_or_today(Some("2026-04-01"), chrono_tz::America::New_York)
+            .expect("valid date should parse");
+        assert_eq!(parsed, date("2026-04-01"));
+    }
+
+    #[test]
+    fn parse_date_or_today_rejects_malformed_date() {
+        let err = parse_date_or_today(Some("06/10/2026"), chrono_tz::America::New_York)
+            .expect_err("malformed date should error");
+        assert!(err.message.contains("invalid date format"));
     }
 }
