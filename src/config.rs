@@ -129,10 +129,23 @@ pub struct ServerConfig {
     pub bind_addr: std::net::IpAddr,
     pub port: u16,
     pub db_path: String,
+    /// IANA timezone used to compute default dates ("today"/"yesterday")
+    /// for tools that accept an optional date.
+    ///
+    /// Defaults to America/New_York: MLB Stats API schedule dates are
+    /// US-Eastern-anchored, and Eastern midnight roughly coincides with the
+    /// end of the night's slate. Computing "today" in UTC would roll to
+    /// tomorrow at 8pm Eastern / 5pm Pacific, mid-slate.
+    #[serde(default = "default_timezone")]
+    pub timezone: chrono_tz::Tz,
 }
 
 fn default_bind_addr() -> std::net::IpAddr {
     std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+}
+
+fn default_timezone() -> chrono_tz::Tz {
+    chrono_tz::America::New_York
 }
 
 impl ServerConfig {
@@ -163,5 +176,61 @@ impl Config {
             projections: raw.projections,
             server: raw.server,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn write_config(server_extra: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+[fantrax]
+user_secret_id = "secret"
+
+[[leagues]]
+id = "abc123"
+name = "Test League"
+league_type = "h2h"
+lineup = "daily"
+
+[projections]
+source = "projected_ZipsRos"
+refresh_hours = 24
+
+[server]
+port = 3001
+db_path = "/tmp/test.db"
+{server_extra}
+"#
+        )
+        .expect("write temp config");
+        file
+    }
+
+    #[test]
+    fn timezone_defaults_to_eastern_when_omitted() {
+        let file = write_config("");
+        let config = Config::load(file.path()).expect("config should load");
+        assert_eq!(config.server.timezone, chrono_tz::America::New_York);
+    }
+
+    #[test]
+    fn timezone_parses_explicit_iana_name() {
+        let file = write_config("timezone = \"America/Los_Angeles\"");
+        let config = Config::load(file.path()).expect("config should load");
+        assert_eq!(config.server.timezone, chrono_tz::America::Los_Angeles);
+    }
+
+    #[test]
+    fn timezone_rejects_invalid_name() {
+        let file = write_config("timezone = \"Not/A_Zone\"");
+        let err = Config::load(file.path()).expect_err("invalid timezone should fail");
+        assert!(matches!(err, ConfigError::Parse(_)), "got: {err:?}");
     }
 }

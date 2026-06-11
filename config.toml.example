@@ -74,3 +74,14 @@ port = 3001
 # Path to the SQLite database file. Tilde (~) expands to $HOME.
 # Parent directories are created automatically if they don't exist.
 db_path = "~/.local/share/fantrax-mcp/fantrax.db"
+
+# IANA timezone used to compute default dates ("today" / "yesterday") for
+# tools that accept an optional date (get_probable_starters, optimize_lineup,
+# get_briefing, get_player_snippet).
+#
+# Default: "America/New_York". MLB Stats API schedule dates are anchored to
+# US Eastern time, and Eastern midnight roughly coincides with the end of the
+# night's slate — so Eastern is the right default even if you live elsewhere.
+# (Computing "today" in UTC rolls to tomorrow at 8pm ET / 5pm PT, mid-slate,
+# which made evening tool calls target the wrong day's schedule.)
+timezone = "America/New_York"
