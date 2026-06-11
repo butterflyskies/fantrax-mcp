@@ -286,6 +286,62 @@ fn unresolved_note_counts_and_cites_crosswalk_issue() {
     );
 }
 
+// ─── Wire-contract snapshots ────────────────────────────────────────────────
+//
+// `Briefing` is MCP tool output consumed by an LLM client, so its serialized
+// JSON shape is a wire contract. These snapshots pin the camelCase field
+// names and structure — including the `unresolved_players`/`unresolved_note`
+// fields added for the missing Fantrax→MLB crosswalk (see #11).
+
+/// A deterministic, fully-populated briefing fixture. Dates are pinned; no
+/// live API calls.
+fn briefing_fixture() -> Briefing {
+    Briefing {
+        league_name: "Ho Ho Homers".to_string(),
+        league_id: LeagueId::new("abc123xyz"),
+        league_type: "roto".to_string(),
+        date: NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(),
+        what_happened: vec![
+            PlayerSnippet {
+                player_name: "Shohei Ohtani".to_string(),
+                line: "2-4, HR, 3 RBI".to_string(),
+                notable: true,
+            },
+            PlayerSnippet {
+                player_name: "Mike Trout".to_string(),
+                line: "IL10".to_string(),
+                notable: false,
+            },
+        ],
+        what_to_do: vec![ActionItem {
+            urgency: Urgency::Now,
+            action: "Move Mike Trout to IL or bench".to_string(),
+            reason: "Mike Trout has status 'IL10' but is in an active lineup slot (OF)".to_string(),
+        }],
+        hot_takes: vec!["No recent recommendations in the ledger.".to_string()],
+        unresolved_players: vec![],
+        unresolved_note: None,
+    }
+}
+
+#[test]
+fn briefing_wire_shape_with_unresolved_players() {
+    let unresolved_players = vec!["Manny Machado".to_string(), "Zack Wheeler".to_string()];
+    let briefing = Briefing {
+        unresolved_note: unresolved_note(&unresolved_players),
+        unresolved_players,
+        ..briefing_fixture()
+    };
+    insta::assert_json_snapshot!(briefing);
+}
+
+#[test]
+fn briefing_wire_shape_without_unresolved_players() {
+    // `unresolved_players` serializes as an empty array (it is not skipped);
+    // `unresolved_note` is omitted entirely when `None`.
+    insta::assert_json_snapshot!(briefing_fixture());
+}
+
 #[test]
 fn merge_unresolved_dedups_preserving_order() {
     let merged = merge_unresolved(
