@@ -1,0 +1,33 @@
+---
+source: src/briefing/tests.rs
+expression: briefing_fixture()
+---
+{
+  "leagueName": "Ho Ho Homers",
+  "leagueId": "abc123xyz",
+  "leagueType": "roto",
+  "date": "2026-06-10",
+  "whatHappened": [
+    {
+      "playerName": "Shohei Ohtani",
+      "line": "2-4, HR, 3 RBI",
+      "notable": true
+    },
+    {
+      "playerName": "Mike Trout",
+      "line": "IL10",
+      "notable": false
+    }
+  ],
+  "whatToDo": [
+    {
+      "urgency": "now",
+      "action": "Move Mike Trout to IL or bench",
+      "reason": "Mike Trout has status 'IL10' but is in an active lineup slot (OF)"
+    }
+  ],
+  "hotTakes": [
+    "No recent recommendations in the ledger."
+  ],
+  "unresolvedPlayers": []
+}

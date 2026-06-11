@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::analysis;
 use crate::config::{LeagueConfig, LineupType};
 use crate::db::Database;
-use crate::fantrax::{FantraxClient, Roster};
+use crate::fantrax::{FantraxClient, Roster, RosterPlayer};
 use crate::mlb::{BatterLine, Boxscore, MlbClient, PitcherLine};
 use crate::types::{LeagueId, TeamId};
 
@@ -23,6 +23,14 @@ pub struct Briefing {
     pub what_happened: Vec<PlayerSnippet>,
     pub what_to_do: Vec<ActionItem>,
     pub hot_takes: Vec<String>,
+    /// Names of roster players that could not be resolved to MLB Stats API
+    /// IDs. These players are excluded from boxscore lookups and platoon
+    /// analysis rather than reported with fabricated "DNP" lines.
+    #[serde(default)]
+    pub unresolved_players: Vec<String>,
+    /// Human-readable note explaining `unresolved_players`, when non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_note: Option<String>,
 }
 
 /// One player's stat line (or status) from yesterday.
@@ -85,19 +93,26 @@ pub async fn generate_briefing(
 ) -> Result<Briefing, BriefingError> {
     let yesterday = date - chrono::Duration::days(1);
 
-    // Fetch roster once and share between layers.
-    let roster = fantrax.get_team_rosters(&league.id, period).await?;
+    // Fetch roster once (enriched with player names — the bare roster
+    // endpoint returns IDs only) and share between layers.
+    let roster = fantrax
+        .get_team_rosters_enriched(&league.id, period)
+        .await?;
 
     // ── Layer 1: What happened ─────────────────────────────────────────
-    let what_happened = build_what_happened(league, team_id, yesterday, mlb, &roster).await?;
+    let (what_happened, unresolved_l1) =
+        build_what_happened(league, team_id, yesterday, mlb, &roster).await?;
 
     // ── Layer 2: What to do ────────────────────────────────────────────
-    let what_to_do = build_what_to_do(league, team_id, date, mlb, &roster).await?;
+    let (what_to_do, unresolved_l2) = build_what_to_do(league, team_id, date, mlb, &roster).await?;
 
     // ── Layer 3: Hot takes (stub) ──────────────────────────────────────
     let hot_takes = build_hot_takes(&league.id, db).await;
 
     let league_type = league.league_type.to_string();
+
+    let unresolved_players = merge_unresolved(unresolved_l1, unresolved_l2);
+    let unresolved_note = unresolved_note(&unresolved_players);
 
     Ok(Briefing {
         league_name: league.name.clone(),
@@ -107,19 +122,66 @@ pub async fn generate_briefing(
         what_happened,
         what_to_do,
         hot_takes,
+        unresolved_players,
+        unresolved_note,
     })
+}
+
+// ─── MLB ID resolution ─────────────────────────────────────────────────────
+
+/// Resolve a Fantrax roster player to an MLB Stats API person ID.
+///
+/// There is currently no Fantrax→MLB ID crosswalk (issue #11), so this always
+/// returns `None`. Fantrax player IDs are alphanumeric strings (e.g. "03pit")
+/// in a completely separate ID space from MLB's numeric person IDs. Do NOT
+/// "fix" this by parsing the Fantrax ID as a number: an all-digit Fantrax ID
+/// would parse successfully and silently fetch a *different* player's MLB
+/// record. Callers must treat `None` as "skip and report", never as "DNP".
+fn resolve_mlb_id(_player: &RosterPlayer) -> Option<u64> {
+    None
+}
+
+/// Merge unresolved-player name lists from multiple briefing layers,
+/// deduplicating while preserving first-seen order.
+fn merge_unresolved(a: Vec<String>, b: Vec<String>) -> Vec<String> {
+    let mut merged = a;
+    for name in b {
+        if !merged.contains(&name) {
+            merged.push(name);
+        }
+    }
+    merged
+}
+
+/// Build the human-readable annotation for unresolved roster players.
+fn unresolved_note(unresolved: &[String]) -> Option<String> {
+    match unresolved.len() {
+        0 => None,
+        1 => Some(
+            "1 roster player could not be resolved to an MLB ID \
+             (Fantrax→MLB crosswalk pending, see #11)"
+                .to_string(),
+        ),
+        n => Some(format!(
+            "{n} roster players could not be resolved to MLB IDs \
+             (Fantrax→MLB crosswalk pending, see #11)"
+        )),
+    }
 }
 
 // ─── Layer 1: What happened ────────────────────────────────────────────────
 
 /// Pull yesterday's boxscores and find each roster player's stat line.
+///
+/// Returns the snippets plus the names of players that could not be resolved
+/// to MLB IDs (and were therefore skipped, not reported as "DNP").
 async fn build_what_happened(
     league: &LeagueConfig,
     team_id: &TeamId,
     yesterday: NaiveDate,
     mlb: &MlbClient,
     roster: &Roster,
-) -> Result<Vec<PlayerSnippet>, BriefingError> {
+) -> Result<(Vec<PlayerSnippet>, Vec<String>), BriefingError> {
     let team = roster.teams.iter().find(|t| t.team_id == *team_id);
     let players = match team {
         Some(t) => &t.players,
@@ -131,24 +193,45 @@ async fn build_what_happened(
         }
     };
 
-    // Fetch yesterday's schedule and all boxscores.
-    let games = mlb.get_schedule(yesterday).await?;
+    // Only fetch boxscores if at least one player is resolvable to an MLB ID
+    // — otherwise the fetches can't match anyone.
+    let any_resolvable = players
+        .iter()
+        .any(|rp| !is_injured_status(&rp.roster_status) && resolve_mlb_id(rp).is_some());
+
     let mut boxscores: Vec<Boxscore> = Vec::new();
-    for game in &games {
-        // Only fetch boxscores for completed or in-progress games.
-        if game.status == "Final" || game.status == "Live" {
-            let is_final = game.status == "Final";
-            match mlb.get_boxscore(game.game_pk, is_final).await {
-                Ok(bs) => boxscores.push(bs),
-                Err(e) => {
-                    tracing::warn!(game_pk = game.game_pk, error = %e, "skipping boxscore");
+    if any_resolvable {
+        // Fetch yesterday's schedule and all boxscores.
+        let games = mlb.get_schedule(yesterday).await?;
+        for game in &games {
+            // Only fetch boxscores for completed or in-progress games.
+            if game.status == "Final" || game.status == "Live" {
+                let is_final = game.status == "Final";
+                match mlb.get_boxscore(game.game_pk, is_final).await {
+                    Ok(bs) => boxscores.push(bs),
+                    Err(e) => {
+                        tracing::warn!(game_pk = game.game_pk, error = %e, "skipping boxscore");
+                    }
                 }
             }
         }
     }
 
-    // For each roster player, find their line in yesterday's boxscores.
+    Ok(snippets_from_boxscores(players, &boxscores))
+}
+
+/// For each roster player, find their line in yesterday's boxscores.
+///
+/// Players that cannot be resolved to an MLB ID are skipped and returned in
+/// the second tuple element — a missing crosswalk entry must not be reported
+/// as "DNP". "DNP" is reserved for resolvable players with no boxscore line.
+fn snippets_from_boxscores(
+    players: &[RosterPlayer],
+    boxscores: &[Boxscore],
+) -> (Vec<PlayerSnippet>, Vec<String>) {
     let mut snippets = Vec::new();
+    let mut unresolved = Vec::new();
+
     for rp in players {
         // Check injury status first.
         if is_injured_status(&rp.roster_status) {
@@ -160,33 +243,33 @@ async fn build_what_happened(
             continue;
         }
 
-        // Try to parse player_id as MLB numeric ID.
-        let mlb_id: Option<u64> = rp.player_id.as_str().parse().ok();
+        let Some(pid) = resolve_mlb_id(rp) else {
+            unresolved.push(rp.name.clone());
+            continue;
+        };
 
+        // Search boxscores for this player's batting or pitching line.
         let mut found = false;
-        if let Some(pid) = mlb_id {
-            // Search boxscores for this player's batting line.
-            for bs in &boxscores {
-                if let Some(line) = find_batter_line(bs, pid) {
-                    let (formatted, notable) = format_batter_snippet(&line);
-                    snippets.push(PlayerSnippet {
-                        player_name: rp.name.clone(),
-                        line: formatted,
-                        notable,
-                    });
-                    found = true;
-                    break;
-                }
-                if let Some(line) = find_pitcher_line(bs, pid) {
-                    let (formatted, notable) = format_pitcher_snippet(&line);
-                    snippets.push(PlayerSnippet {
-                        player_name: rp.name.clone(),
-                        line: formatted,
-                        notable,
-                    });
-                    found = true;
-                    break;
-                }
+        for bs in boxscores {
+            if let Some(line) = find_batter_line(bs, pid) {
+                let (formatted, notable) = format_batter_snippet(&line);
+                snippets.push(PlayerSnippet {
+                    player_name: rp.name.clone(),
+                    line: formatted,
+                    notable,
+                });
+                found = true;
+                break;
+            }
+            if let Some(line) = find_pitcher_line(bs, pid) {
+                let (formatted, notable) = format_pitcher_snippet(&line);
+                snippets.push(PlayerSnippet {
+                    player_name: rp.name.clone(),
+                    line: formatted,
+                    notable,
+                });
+                found = true;
+                break;
             }
         }
 
@@ -199,7 +282,7 @@ async fn build_what_happened(
         }
     }
 
-    Ok(snippets)
+    (snippets, unresolved)
 }
 
 fn find_batter_line(boxscore: &Boxscore, player_id: u64) -> Option<BatterLine> {
@@ -348,19 +431,23 @@ fn format_injury_line(status: &str) -> String {
 // ─── Layer 2: What to do ───────────────────────────────────────────────────
 
 /// Generate action items based on today's matchups and roster status.
+///
+/// Returns the action items plus the names of players that could not be
+/// resolved to MLB IDs (and were therefore excluded from platoon analysis).
 async fn build_what_to_do(
     league: &LeagueConfig,
     team_id: &TeamId,
     today: NaiveDate,
     mlb: &MlbClient,
     roster: &Roster,
-) -> Result<Vec<ActionItem>, BriefingError> {
+) -> Result<(Vec<ActionItem>, Vec<String>), BriefingError> {
     let mut items = Vec::new();
+    let mut unresolved = Vec::new();
 
     let team = roster.teams.iter().find(|t| t.team_id == *team_id);
     let players = match team {
         Some(t) => &t.players,
-        None => return Ok(items),
+        None => return Ok((items, unresolved)),
     };
 
     let games = mlb.get_schedule(today).await?;
@@ -382,16 +469,23 @@ async fn build_what_to_do(
     // ── Lineup advice depends on league type ───────────────────────
     match league.lineup {
         LineupType::Daily => {
-            // Run platoon analysis for start/sit recs.
+            // Run platoon analysis for start/sit recs. Players without a
+            // resolvable MLB ID are excluded and reported, not silently
+            // dropped.
+            let (resolved, not_resolved) = partition_resolvable(players);
+            unresolved = not_resolved;
+
             let mut player_pairs = Vec::new();
-            for rp in players {
-                if is_injured_status(&rp.roster_status) {
-                    continue;
-                }
-                if let Ok(mlb_id) = rp.player_id.as_str().parse::<u64>()
-                    && let Ok(player) = mlb.get_player(mlb_id).await
-                {
-                    player_pairs.push((rp.clone(), player));
+            for (rp, mlb_id) in resolved {
+                match mlb.get_player(mlb_id).await {
+                    Ok(player) => player_pairs.push((rp.clone(), player)),
+                    Err(e) => {
+                        tracing::warn!(
+                            player = %rp.name, mlb_id, error = %e,
+                            "MLB player lookup failed; excluding from platoon analysis"
+                        );
+                        unresolved.push(rp.name.clone());
+                    }
                 }
             }
 
@@ -443,7 +537,25 @@ async fn build_what_to_do(
         }
     }
 
-    Ok(items)
+    Ok((items, unresolved))
+}
+
+/// Partition active (non-injured) roster players by whether they resolve to
+/// an MLB ID. Returns (resolved players with their MLB IDs, names of players
+/// that could not be resolved).
+fn partition_resolvable(players: &[RosterPlayer]) -> (Vec<(&RosterPlayer, u64)>, Vec<String>) {
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+    for rp in players {
+        if is_injured_status(&rp.roster_status) {
+            continue;
+        }
+        match resolve_mlb_id(rp) {
+            Some(mlb_id) => resolved.push((rp, mlb_id)),
+            None => unresolved.push(rp.name.clone()),
+        }
+    }
+    (resolved, unresolved)
 }
 
 /// Check if a position string represents a bench or IL slot.
