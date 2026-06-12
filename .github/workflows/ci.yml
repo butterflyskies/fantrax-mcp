@@ -37,6 +37,31 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo nextest run --workspace --no-fail-fast
 
+  # Live-endpoint smoke tests (the #[ignore]-tagged live_* tests). Run on
+  # every CI pass but non-blocking: external APIs being down shouldn't gate
+  # merges, but a wire-shape drift should be visible the day it happens.
+  smoke:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-03-27)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-bin: "false"
+      - name: Install cargo-nextest
+        run: |
+          curl -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.136/cargo-nextest-0.9.136-x86_64-unknown-linux-gnu.tar.gz" \
+            -o /tmp/cargo-nextest.tar.gz
+          echo "a098eed56f2dd88c7fdca1e554a6b99fa1ffbd2a7a1c41b865700112981f6f52  /tmp/cargo-nextest.tar.gz" | sha256sum -c -
+          tar xzf /tmp/cargo-nextest.tar.gz -C /usr/local/bin
+      - name: Run live smoke tests (non-blocking)
+        run: cargo nextest run --workspace --run-ignored ignored-only --no-fail-fast
+
   cross-compile:
     strategy:
       fail-fast: false
