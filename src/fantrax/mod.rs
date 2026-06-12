@@ -383,40 +383,14 @@ impl FantraxClient {
 
         tracing::debug!(sport, response_keys = ?resp.as_object().map(|o| o.keys().collect::<Vec<_>>()), "getPlayerIds raw response");
 
-        // Parse player IDs. Expected shape: array of {id, name} or similar.
-        let players_value = resp
-            .get("playerIds")
-            .or_else(|| resp.get("players"))
-            .or_else(|| resp.get("data").and_then(|d| d.get("playerIds")));
-
-        let players = if let Some(arr) = players_value.and_then(|v| v.as_array()) {
-            arr.iter()
-                .filter_map(|entry| {
-                    let id: PlayerId = entry
-                        .get("playerId")
-                        .or_else(|| entry.get("id"))
-                        .and_then(|v| v.as_str())
-                        .map(PlayerId::new)?;
-                    let name = entry
-                        .get("name")
-                        .or_else(|| entry.get("playerName"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                        .unwrap_or_else(|| "Unknown".to_string());
-                    Some(PlayerIdEntry { id, name })
-                })
-                .collect()
-        } else if let Some(obj) = players_value.and_then(|v| v.as_object()) {
-            // Sometimes the API returns {playerId: playerName, ...} as an object.
-            obj.iter()
-                .map(|(id, name)| PlayerIdEntry {
-                    id: PlayerId::new(id),
-                    name: name.as_str().unwrap_or("Unknown").to_string(),
-                })
-                .collect()
-        } else {
-            vec![]
-        };
+        let players = parse_player_id_entries(&resp);
+        if players.is_empty() {
+            tracing::warn!(
+                sport,
+                "getPlayerIds parsed to zero players — wire shape may have drifted, \
+                 roster names will render as Unknown (see issue #27)"
+            );
+        }
 
         Ok(PlayerIds {
             sport: sport.to_string(),
@@ -466,6 +440,71 @@ fn enrich_roster_names(roster: &mut Roster, player_ids: &PlayerIds) {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Parse the `getPlayerIds` response into ID/name entries.
+///
+/// Live wire shape (captured 2026-06-11): the root is an object keyed by
+/// Fantrax player ID, with object values like
+/// `{"statsIncId": 11731, "rotowireId": 16070, "sportRadarId": "…",
+///   "name": "Henderson, Gunnar", "fantraxId": "050w9", "team": "BAL",
+///   "position": "SS"}` — there is no `playerIds`/`players` wrapper key.
+/// Some entries lack some cross-ID fields; some have team `"(N/A)"`.
+/// The wrapper-key paths are kept as fallbacks for forward compatibility.
+fn parse_player_id_entries(resp: &Value) -> Vec<PlayerIdEntry> {
+    let players_value = resp
+        .get("playerIds")
+        .or_else(|| resp.get("players"))
+        .or_else(|| resp.get("data").and_then(|d| d.get("playerIds")));
+
+    if let Some(arr) = players_value.and_then(|v| v.as_array()) {
+        arr.iter()
+            .filter_map(|entry| {
+                let id: PlayerId = entry
+                    .get("playerId")
+                    .or_else(|| entry.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(PlayerId::new)?;
+                let name = entry
+                    .get("name")
+                    .or_else(|| entry.get("playerName"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| "Unknown".to_string());
+                Some(PlayerIdEntry { id, name })
+            })
+            .collect()
+    } else if let Some(obj) = players_value.and_then(|v| v.as_object()) {
+        // Sometimes the API returns {playerId: playerName, ...} as an object.
+        obj.iter()
+            .map(|(id, name)| PlayerIdEntry {
+                id: PlayerId::new(id),
+                name: name.as_str().unwrap_or("Unknown").to_string(),
+            })
+            .collect()
+    } else if let Some(root) = resp.as_object() {
+        // Live shape: the root itself is the ID→entry map. Only accept
+        // entries whose value is an object carrying the expected fields
+        // (`fantraxId` + `name`), so an error body like {"error": "…"}
+        // parses to zero entries instead of garbage.
+        // Note: entry values also carry cross-IDs (statsIncId, rotowireId,
+        // sportRadarId) on the wire — not parsed here, see issue #11.
+        root.iter()
+            .filter_map(|(id, entry)| {
+                let entry = entry.as_object()?;
+                if !entry.contains_key("fantraxId") {
+                    return None;
+                }
+                let name = entry.get("name")?.as_str()?;
+                Some(PlayerIdEntry {
+                    id: PlayerId::new(id),
+                    name: name.to_string(),
+                })
+            })
+            .collect()
+    } else {
+        vec![]
+    }
+}
 
 fn extract_team_roster(team: &Value, key_as_id: Option<&str>) -> Option<TeamRoster> {
     let team_id: TeamId = if let Some(tid) = key_as_id {
@@ -661,5 +700,175 @@ mod tests {
         let player = extract_roster_player(&json).unwrap();
         assert_eq!(player.player_id.as_str(), "03pit");
         assert_eq!(player.name, "Unknown");
+    }
+
+    /// Captured real `getPlayerIds?sport=MLB` response (2026-06-11), trimmed
+    /// to 12 entries verbatim. The root is the ID→entry map — no wrapper key.
+    /// Includes an entry with no cross-IDs (05294) and team "(N/A)" entries.
+    const PLAYER_IDS_FIXTURE: &str = r#"{
+        "050w9": {
+            "statsIncId": 11731,
+            "rotowireId": 16070,
+            "sportRadarId": "770894ef-45bc-4a10-a18e-d35b4b1fa867",
+            "name": "Henderson, Gunnar",
+            "fantraxId": "050w9",
+            "team": "BAL",
+            "position": "SS"
+        },
+        "050w8": {
+            "statsIncId": 11792,
+            "rotowireId": 16074,
+            "name": "Cavaco, Keoni",
+            "fantraxId": "050w8",
+            "team": "(N/A)",
+            "position": "SS"
+        },
+        "05294": {
+            "name": "Sanchez, Junior",
+            "fantraxId": "05294",
+            "team": "(N/A)",
+            "position": "3B"
+        },
+        "0527f": {
+            "rotowireId": 16328,
+            "sportRadarId": "163b3757-65f4-4475-86d5-2beb07c2fc57",
+            "name": "Made, Kevin",
+            "fantraxId": "0527f",
+            "team": "WSH",
+            "position": "2B"
+        },
+        "03nuc": {
+            "statsIncId": 10514,
+            "rotowireId": 14495,
+            "sportRadarId": "71791d18-9c59-4e2f-863d-007d3cdd7efd",
+            "name": "Castillo, Luis",
+            "fantraxId": "03nuc",
+            "team": "SEA",
+            "position": "SP"
+        },
+        "0527e": {
+            "rotowireId": 16332,
+            "sportRadarId": "6b303eb0-7b59-49fa-807a-633e73c54ed6",
+            "name": "Mena, Ismael",
+            "fantraxId": "0527e",
+            "team": "(N/A)",
+            "position": "CF"
+        },
+        "05tzo": {
+            "rotowireId": 17964,
+            "sportRadarId": "1aa50e2a-e8f4-46ce-a5e9-556db30a8848",
+            "name": "Ritchie, J.R.",
+            "fantraxId": "05tzo",
+            "team": "ATL",
+            "position": "SP"
+        },
+        "05tzp": {
+            "rotowireId": 18869,
+            "sportRadarId": "202b4e9a-ee8b-4146-9935-8b4bbb0ed0ea",
+            "name": "Gonzalez, Jacob",
+            "fantraxId": "05tzp",
+            "team": "CHW",
+            "position": "2B"
+        },
+        "05tzm": {
+            "rotowireId": 17429,
+            "name": "Hickey, Nathan",
+            "fantraxId": "05tzm",
+            "team": "BOS",
+            "position": "1B"
+        },
+        "05tzk": {
+            "name": "Shawver, Evan",
+            "fantraxId": "05tzk",
+            "team": "COL",
+            "position": "RP"
+        },
+        "05ua0": {
+            "rotowireId": 17450,
+            "name": "Debiec, Max",
+            "fantraxId": "05ua0",
+            "team": "(N/A)",
+            "position": "SP"
+        },
+        "0529m": {
+            "rotowireId": 16450,
+            "sportRadarId": "05687b82-fe13-46b3-8bf8-0df7a8aaa2e4",
+            "name": "Cerda, Allan",
+            "fantraxId": "0529m",
+            "team": "(N/A)",
+            "position": "CF"
+        }
+    }"#;
+
+    #[test]
+    fn parse_player_ids_live_wire_shape() {
+        // The live response root IS the ID→entry map (no playerIds/players key).
+        let resp: Value = serde_json::from_str(PLAYER_IDS_FIXTURE).unwrap();
+        let players = parse_player_id_entries(&resp);
+
+        assert_eq!(players.len(), 12);
+
+        let gunnar = players
+            .iter()
+            .find(|p| p.id.as_str() == "050w9")
+            .expect("Gunnar Henderson (050w9) should be parsed");
+        assert_eq!(gunnar.name, "Henderson, Gunnar");
+
+        // Entry with no cross-IDs (statsIncId/rotowireId/sportRadarId) still parses.
+        let junior = players
+            .iter()
+            .find(|p| p.id.as_str() == "05294")
+            .expect("entry without cross-IDs should be parsed");
+        assert_eq!(junior.name, "Sanchez, Junior");
+    }
+
+    #[test]
+    fn parse_player_ids_error_body_yields_no_entries() {
+        // A root object whose values are not player entries (e.g. an error
+        // body) must not produce garbage PlayerIdEntry values.
+        let resp: Value = serde_json::json!({ "error": "something went wrong" });
+        let players = parse_player_id_entries(&resp);
+        assert!(players.is_empty());
+    }
+
+    #[test]
+    fn parse_player_ids_legacy_wrapper_keys_still_work() {
+        // Forward-compat fallbacks: array under "playerIds" and {id: name} map
+        // under "players".
+        let resp: Value = serde_json::json!({
+            "playerIds": [{ "playerId": "03pit", "name": "Shohei Ohtani" }]
+        });
+        let players = parse_player_id_entries(&resp);
+        assert_eq!(players.len(), 1);
+        assert_eq!(players[0].id.as_str(), "03pit");
+        assert_eq!(players[0].name, "Shohei Ohtani");
+
+        let resp: Value = serde_json::json!({
+            "players": { "04ru7": "Manny Machado" }
+        });
+        let players = parse_player_id_entries(&resp);
+        assert_eq!(players.len(), 1);
+        assert_eq!(players[0].id.as_str(), "04ru7");
+        assert_eq!(players[0].name, "Manny Machado");
+    }
+
+    // ── Live API smoke test (ignored by default — hits the real Fantrax API) ──
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_player_ids() {
+        // getPlayerIds requires no auth; the secret is unused on this endpoint.
+        let client = FantraxClient::new(secrecy::SecretString::from("unused"));
+
+        let result = client
+            .get_player_ids("MLB")
+            .await
+            .expect("live getPlayerIds should return HTTP 200 and parse");
+
+        assert!(
+            result.players.len() > 1000,
+            "live getPlayerIds should return >1000 MLB players, got {}",
+            result.players.len()
+        );
     }
 }
