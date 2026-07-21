@@ -77,7 +77,6 @@ pub struct LeagueConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum LeagueType {
     H2h,
     Roto,
@@ -98,7 +97,6 @@ impl fmt::Display for LeagueType {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum LineupType {
     Daily,
     Weekly,

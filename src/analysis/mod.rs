@@ -23,7 +23,6 @@ pub struct StartSitRecommendation {
 /// Start, sit, or monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-#[non_exhaustive]
 pub enum LineupVerdict {
     Start,
     Sit,
@@ -43,7 +42,6 @@ impl fmt::Display for LineupVerdict {
 /// How the batter-pitcher matchup breaks down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-#[non_exhaustive]
 pub enum MatchupAdvantage {
     /// Batter has the platoon edge (e.g. RHB vs LHP).
     Platoon,
