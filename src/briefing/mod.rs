@@ -56,7 +56,6 @@ pub struct ActionItem {
 /// How urgently something needs attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-#[non_exhaustive]
 pub enum Urgency {
     Now,
     Soon,
